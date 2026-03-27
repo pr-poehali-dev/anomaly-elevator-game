@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
-type Screen = "menu" | "game" | "settings" | "shop";
+// ─── TYPES ───────────────────────────────────────────────────────────────────
+type Screen = "menu" | "game" | "settings" | "shop" | "lobby";
 type Direction = "up" | "down" | "left" | "right";
 
+// ─── CONSTANTS ───────────────────────────────────────────────────────────────
 const MAP_COLS = 20;
 const MAP_ROWS = 15;
 const MAX_FLOOR = 8;
-// Monster spawns after this many player steps
-const MONSTER_STEPS_DELAY = 20;
-// Base vision radius (upgradeable)
+const MONSTER_TIMER_MS = 500;       // monster ticks every 500ms, 1 step per tick
+const MONSTER_SPAWN_SECS = 15;      // seconds before monster appears
+const ANIM_MS = 160;                // movement animation duration
 const BASE_VISION = 3;
 
 const T_FLOOR = 0;
@@ -39,40 +41,53 @@ const BASE_MAP: number[][] = [
   [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
 ];
 
-interface Anomaly { x: number; y: number; id: number; visible: boolean; type: number; }
-interface Player { x: number; y: number; hiding: boolean; }
-interface Monster { x: number; y: number; active: boolean; }
+// ─── INTERFACES ──────────────────────────────────────────────────────────────
+interface Anomaly  { x: number; y: number; id: number; visible: boolean; type: number; }
+interface Player   { x: number; y: number; hiding: boolean; }
+interface Monster  { x: number; y: number; active: boolean; }
 interface Settings { sfx: boolean; crt: boolean; scanlines: boolean; }
-
-// Upgrades: vision radius levels and battery life (steps before monster comes, displayed as "battery")
-interface Upgrades {
-  visionLevel: number;   // 0=3, 1=4, 2=5, 3=6 tiles
-  batteryLevel: number;  // 0=20, 1=28, 2=38, 3=50 steps before monster
+interface Upgrades { visionLevel: number; batteryLevel: number; }
+interface NetPlayer { id: string; name: string; x: number; y: number; hiding: boolean; dead: boolean; color: string; }
+interface MultiState {
+  roomId: string;
+  playerId: string;
+  playerName: string;
+  playerColor: string;
+  isHost: boolean;
 }
 
-const VISION_LEVELS = [3, 4, 5, 6];
+const VISION_LEVELS  = [3, 4, 5, 6];
 const BATTERY_LEVELS = [20, 28, 38, 50];
-const UPGRADE_COSTS = { vision: [0, 3, 5, 9], battery: [0, 2, 4, 8] };
+const UPGRADE_COSTS  = { vision: [0, 3, 5, 9], battery: [0, 2, 4, 8] };
 
+const ANOMALY_DATA = [
+  { symbol: "✦", label: "СИГНАЛ",   color: "#ff3366", glow: "#ff003355" },
+  { symbol: "◈", label: "ПОМЕХА",   color: "#ff6600", glow: "#ff440055" },
+  { symbol: "⬡", label: "ИСТОЧНИК", color: "#cc00ff", glow: "#9900aa55" },
+  { symbol: "⚿", label: "КОНТАКТ",  color: "#00ccff", glow: "#006688aa" },
+];
+
+// ─── GAME URL (from func2url.json) ───────────────────────────────────────────
+const GAME_URL = "https://functions.poehali.dev/62432b4c-9feb-4e59-a608-ac704a150833";
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 function isWalkable(x: number, y: number): boolean {
   if (x < 0 || x >= MAP_COLS || y < 0 || y >= MAP_ROWS) return false;
   return !SOLID.has(BASE_MAP[y][x]);
 }
 
-function getWalkable(): { x: number; y: number }[] {
-  const result: { x: number; y: number }[] = [];
-  for (let r = 1; r < MAP_ROWS - 1; r++)
-    for (let c = 1; c < MAP_COLS - 1; c++)
-      if (BASE_MAP[r][c] === T_FLOOR) result.push({ x: c, y: r });
-  return result;
+function getWalkable() {
+  const r: { x: number; y: number }[] = [];
+  for (let row = 1; row < MAP_ROWS - 1; row++)
+    for (let col = 1; col < MAP_COLS - 1; col++)
+      if (BASE_MAP[row][col] === T_FLOOR) r.push({ x: col, y: row });
+  return r;
 }
 
 function generateAnomalies(): Anomaly[] {
-  // Always 1-2 anomalies per floor — never 0 so floor always requires action
   const count = Math.floor(Math.random() * 2) + 1;
-  const walkable = getWalkable();
-  const shuffled = [...walkable].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, Math.min(count, shuffled.length)).map((pos, i) => ({
+  const walkable = [...getWalkable()].sort(() => Math.random() - 0.5);
+  return walkable.slice(0, count).map((pos, i) => ({
     x: pos.x, y: pos.y, id: i,
     visible: Math.random() > 0.4,
     type: Math.floor(Math.random() * 4),
@@ -81,9 +96,8 @@ function generateAnomalies(): Anomaly[] {
 
 function bfsPath(from: { x: number; y: number }, to: { x: number; y: number }): { x: number; y: number } | null {
   const queue: { x: number; y: number; path: { x: number; y: number }[] }[] = [{ ...from, path: [] }];
-  const visited = new Set<string>();
-  visited.add(`${from.x},${from.y}`);
-  while (queue.length > 0) {
+  const visited = new Set<string>([`${from.x},${from.y}`]);
+  while (queue.length) {
     const cur = queue.shift()!;
     for (const d of [{ x: 0, y: -1 }, { x: 0, y: 1 }, { x: -1, y: 0 }, { x: 1, y: 0 }]) {
       const nx = cur.x + d.x, ny = cur.y + d.y;
@@ -99,14 +113,12 @@ function bfsPath(from: { x: number; y: number }, to: { x: number; y: number }): 
 }
 
 function computeVisible(player: Player, radius: number): Set<string> {
-  const visible = new Set<string>();
-  visible.add(`${player.x},${player.y}`);
+  const visible = new Set<string>([`${player.x},${player.y}`]);
   for (let angle = 0; angle < 360; angle += 3) {
     const rad = (angle * Math.PI) / 180;
     let px = player.x + 0.5, py = player.y + 0.5;
     for (let dist = 0; dist < radius; dist += 0.5) {
-      px += Math.cos(rad) * 0.5;
-      py += Math.sin(rad) * 0.5;
+      px += Math.cos(rad) * 0.5; py += Math.sin(rad) * 0.5;
       const tx = Math.floor(px), ty = Math.floor(py);
       if (tx < 0 || tx >= MAP_COLS || ty < 0 || ty >= MAP_ROWS) break;
       visible.add(`${tx},${ty}`);
@@ -115,13 +127,6 @@ function computeVisible(player: Player, radius: number): Set<string> {
   }
   return visible;
 }
-
-const ANOMALY_DATA = [
-  { symbol: "✦", label: "СИГНАЛ",   color: "#ff3366", glow: "#ff003355" },
-  { symbol: "◈", label: "ПОМЕХА",   color: "#ff6600", glow: "#ff440055" },
-  { symbol: "⬡", label: "ИСТОЧНИК", color: "#cc00ff", glow: "#9900aa55" },
-  { symbol: "⚿", label: "КОНТАКТ",  color: "#00ccff", glow: "#006688aa" },
-];
 
 function getTileColor(tile: number, floor: number): { bg: string; border?: string } {
   switch (tile) {
@@ -136,48 +141,50 @@ function getTileColor(tile: number, floor: number): { bg: string; border?: strin
   }
 }
 
+// ─── ROOT ─────────────────────────────────────────────────────────────────────
 export default function Index() {
-  const [screen, setScreen] = useState<Screen>("menu");
-  const [floor, setFloor] = useState(MAX_FLOOR);
-  const [player, setPlayer] = useState<Player>({ x: 9, y: 7, hiding: false });
-  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
-  const [message, setMessage] = useState("");
-  // floorVisited tracks which floors the player has ALREADY cleared (used from 8→1)
+  const [screen, setScreen]           = useState<Screen>("menu");
+  const [floor, setFloor]             = useState(MAX_FLOOR);
+  const [player, setPlayer]           = useState<Player>({ x: 9, y: 7, hiding: false });
+  const [anomalies, setAnomalies]     = useState<Anomaly[]>([]);
+  const [message, setMessage]         = useState("");
   const [clearedFloors, setClearedFloors] = useState<Set<number>>(new Set());
-  const [settings, setSettings] = useState<Settings>({ sfx: true, crt: true, scanlines: true });
-  const [flashing, setFlashing] = useState(false);
-  const [win, setWin] = useState(false);
+  const [settings, setSettings]       = useState<Settings>({ sfx: true, crt: true, scanlines: true });
+  const [flashing, setFlashing]       = useState(false);
+  const [win, setWin]                 = useState(false);
   const [foundAnomaly, setFoundAnomaly] = useState(false);
-  const [monster, setMonster] = useState<Monster>({ x: 0, y: 0, active: false });
-  const [dead, setDead] = useState(false);
+  const [monster, setMonster]         = useState<Monster>({ x: 0, y: 0, active: false });
+  const [dead, setDead]               = useState(false);
   const [visibleTiles, setVisibleTiles] = useState<Set<string>>(new Set());
-  // Steps counter for monster spawn
-  const [stepCount, setStepCount] = useState(0);
-  // Tokens = score currency earned per cleared floor
-  const [tokens, setTokens] = useState(0);
-  const [upgrades, setUpgrades] = useState<Upgrades>({ visionLevel: 0, batteryLevel: 0 });
+  const [tokens, setTokens]           = useState(0);
+  const [upgrades, setUpgrades]       = useState<Upgrades>({ visionLevel: 0, batteryLevel: 0 });
+  // Multiplayer
+  const [multi, setMulti]             = useState<MultiState | null>(null);
+  const [netPlayers, setNetPlayers]   = useState<NetPlayer[]>([]);
+  // Seconds until monster spawns (countdown display)
+  const [spawnCountdown, setSpawnCountdown] = useState(MONSTER_SPAWN_SECS);
 
-  const msgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const audioCtx = useRef<AudioContext | null>(null);
-  const stateRef = useRef({
-    floor, player, anomalies, foundAnomaly, monster, dead,
-    stepCount, clearedFloors, upgrades,
-  });
+  const msgTimer       = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const monsterTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const spawnTimer     = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollTimer      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioCtx       = useRef<AudioContext | null>(null);
+  const stateRef       = useRef({ floor, player, anomalies, foundAnomaly, monster, dead, clearedFloors, upgrades, multi });
 
   useEffect(() => {
-    stateRef.current = { floor, player, anomalies, foundAnomaly, monster, dead, stepCount, clearedFloors, upgrades };
-  }, [floor, player, anomalies, foundAnomaly, monster, dead, stepCount, clearedFloors, upgrades]);
+    stateRef.current = { floor, player, anomalies, foundAnomaly, monster, dead, clearedFloors, upgrades, multi };
+  }, [floor, player, anomalies, foundAnomaly, monster, dead, clearedFloors, upgrades, multi]);
 
-  // Recompute visibility when player moves
   useEffect(() => {
     const radius = VISION_LEVELS[upgrades.visionLevel] ?? BASE_VISION;
     setVisibleTiles(computeVisible(player, radius));
   }, [player.x, player.y, upgrades.visionLevel]);
 
+  // ── AUDIO ──
   const getAudio = useCallback(() => {
-    if (!audioCtx.current) {
+    if (!audioCtx.current)
       audioCtx.current = new (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext || AudioContext)();
-    }
     return audioCtx.current;
   }, []);
 
@@ -185,8 +192,7 @@ export default function Index() {
     if (!settings.sfx) return;
     try {
       const ctx = getAudio();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
+      const osc = ctx.createOscillator(); const gain = ctx.createGain();
       osc.connect(gain); gain.connect(ctx.destination);
       osc.type = type; osc.frequency.setValueAtTime(freq, ctx.currentTime);
       gain.gain.setValueAtTime(vol, ctx.currentTime);
@@ -195,10 +201,10 @@ export default function Index() {
     } catch (_e) { /* ignore */ }
   }, [settings.sfx, getAudio]);
 
-  const playStep   = useCallback(() => playTone(100 + Math.random() * 20, 0.07, "square", 0.04), [playTone]);
-  const playLift   = useCallback(() => { playTone(280, 0.12, "sawtooth", 0.1); setTimeout(() => playTone(220, 0.18, "sawtooth", 0.1), 130); }, [playTone]);
+  const playStep    = useCallback(() => playTone(100 + Math.random() * 20, 0.07, "square", 0.04), [playTone]);
+  const playLift    = useCallback(() => { playTone(280, 0.12, "sawtooth", 0.1); setTimeout(() => playTone(220, 0.18, "sawtooth", 0.1), 130); }, [playTone]);
   const playAnomaly = useCallback(() => { playTone(80, 0.3, "sawtooth", 0.18); setTimeout(() => playTone(55, 0.5, "sawtooth", 0.18), 220); }, [playTone]);
-  const playSuccess = useCallback(() => { [440, 550, 660, 880].forEach((f, i) => setTimeout(() => playTone(f, 0.15, "square", 0.13), i * 90)); }, [playTone]);
+  const playSuccess = useCallback(() => { [440,550,660,880].forEach((f, i) => setTimeout(() => playTone(f, 0.15, "square", 0.13), i*90)); }, [playTone]);
   const playScream  = useCallback(() => { playTone(120, 0.8, "sawtooth", 0.3); setTimeout(() => playTone(80, 0.6, "sawtooth", 0.25), 400); }, [playTone]);
 
   const showMsg = useCallback((text: string, ms = 2500) => {
@@ -207,220 +213,222 @@ export default function Index() {
     msgTimer.current = setTimeout(() => setMessage(""), ms);
   }, []);
 
-  // Monster moves one step (called after each player step)
-  const moveMonsterOneStep = useCallback(() => {
-    const { player: p, monster: m, dead: isDead, upgrades: upg } = stateRef.current;
-    if (isDead || !m.active) return;
-    if (p.hiding) return;
-    if (BASE_MAP[p.y][p.x] === T_ELEVATOR) return;
+  // ── MULTIPLAYER SYNC ──
+  const syncPlayerPos = useCallback((p: Player) => {
+    const { multi: m } = stateRef.current;
+    if (!m) return;
+    fetch(`${GAME_URL}/?action=move`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roomId: m.roomId, playerId: m.playerId, x: p.x, y: p.y, hiding: p.hiding, dead: false }),
+    }).catch(() => {});
+  }, []);
 
-    const doStep = (monsterPos: { x: number; y: number }) => {
-      const next = bfsPath(monsterPos, p);
-      if (!next) return monsterPos;
-      if (next.x === p.x && next.y === p.y) {
-        setDead(true);
-        playScream();
-        showMsg("☠ СХВАЧЕН! Нажми R для рестарта", 99999);
-      }
-      return next;
-    };
+  const syncRoomState = useCallback((patch: object) => {
+    const { multi: m } = stateRef.current;
+    if (!m || !m.isHost) return;
+    fetch(`${GAME_URL}/?action=room_state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roomId: m.roomId, ...patch }),
+    }).catch(() => {});
+  }, []);
 
-    setMonster(prev => {
-      if (!prev.active) return prev;
-      const step1 = doStep({ x: prev.x, y: prev.y });
-      // 50% chance for a second step
-      if (Math.random() < 0.5) {
-        const step2 = doStep(step1);
-        return { ...prev, x: step2.x, y: step2.y };
-      }
-      return { ...prev, x: step1.x, y: step1.y };
-    });
+  const startPolling = useCallback((roomId: string, playerId: string) => {
+    if (pollTimer.current) clearInterval(pollTimer.current);
+    pollTimer.current = setInterval(async () => {
+      try {
+        const res = await fetch(`${GAME_URL}/?action=room&room_id=${roomId}&player_id=${playerId}`);
+        const data = await res.json();
+        setNetPlayers(data.players || []);
+        // Non-host: sync room state from server
+        const { multi: m } = stateRef.current;
+        if (m && !m.isHost) {
+          if (data.floor !== undefined) setFloor(data.floor);
+          if (data.anomalies) setAnomalies(data.anomalies);
+          if (data.foundAnomaly !== undefined) setFoundAnomaly(data.foundAnomaly);
+          if (data.monster) setMonster(data.monster);
+        }
+      } catch (_e) { /* ignore network errors */ }
+    }, 500);
+  }, []);
 
-    // suppress unused warning
-    void upg;
-  }, [playScream, showMsg]);
+  const stopPolling = useCallback(() => {
+    if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null; }
+    if (heartbeatTimer.current) { clearInterval(heartbeatTimer.current); heartbeatTimer.current = null; }
+  }, []);
+
+  // ── MONSTER TIMER (500ms, 1 step) ──
+  const killMonsterTimers = useCallback(() => {
+    if (monsterTimer.current)  { clearInterval(monsterTimer.current);  monsterTimer.current  = null; }
+    if (spawnTimer.current)    { clearInterval(spawnTimer.current);    spawnTimer.current    = null; }
+  }, []);
 
   const spawnMonster = useCallback(() => {
     const walkable = getWalkable();
-    const { player: curPlayer } = stateRef.current;
-    const far = walkable.filter(p => Math.abs(p.x - curPlayer.x) + Math.abs(p.y - curPlayer.y) > 8);
-    const pos = far.length ? far[Math.floor(Math.random() * far.length)] : walkable[0];
-    setMonster({ x: pos.x, y: pos.y, active: true });
+    const { player: p } = stateRef.current;
+    const far = walkable.filter(w => Math.abs(w.x - p.x) + Math.abs(w.y - p.y) > 8);
+    const pos = (far.length ? far : walkable)[Math.floor(Math.random() * (far.length || walkable.length))];
+    const m = { x: pos.x, y: pos.y, active: true };
+    setMonster(m);
+    syncRoomState({ monster: m });
     showMsg("⚠ ДАТЧИК ДВИЖЕНИЯ — В ЗДАНИИ ЧТО-ТО ЕСТЬ", 3000);
     playAnomaly();
-  }, [showMsg, playAnomaly]);
+
+    // 500ms interval, 1 step per tick
+    monsterTimer.current = setInterval(() => {
+      const { player: pl, monster: mo, dead: isDead } = stateRef.current;
+      if (isDead || !mo.active) return;
+      if (pl.hiding || BASE_MAP[pl.y][pl.x] === T_ELEVATOR) return;
+      const next = bfsPath(mo, pl);
+      if (!next) return;
+      const newM = { ...mo, x: next.x, y: next.y };
+      setMonster(newM);
+      syncRoomState({ monster: newM });
+      if (next.x === pl.x && next.y === pl.y) {
+        setDead(true); playScream();
+        showMsg("☠ СХВАЧЕН! Нажми R для рестарта", 99999);
+      }
+    }, MONSTER_TIMER_MS);
+  }, [showMsg, playAnomaly, playScream, syncRoomState]);
+
+  const startSpawnCountdown = useCallback(() => {
+    killMonsterTimers();
+    setSpawnCountdown(MONSTER_SPAWN_SECS);
+    let secs = MONSTER_SPAWN_SECS;
+    spawnTimer.current = setInterval(() => {
+      secs--;
+      setSpawnCountdown(secs);
+      if (secs <= 0) {
+        if (spawnTimer.current) clearInterval(spawnTimer.current);
+        spawnMonster();
+      }
+    }, 1000);
+  }, [killMonsterTimers, spawnMonster]);
 
   const goToFloor = useCallback((f: number) => {
+    killMonsterTimers();
     setMonster({ x: 0, y: 0, active: false });
-    setStepCount(0);
     const anoms = generateAnomalies();
-    setFloor(f);
-    setAnomalies(anoms);
+    setFloor(f); setAnomalies(anoms);
     setPlayer({ x: 9, y: 7, hiding: false });
     setFoundAnomaly(false);
     showMsg(`▶ ЭТАЖ ${f} — ФИКСИРУЮ АКТИВНОСТЬ`, 2800);
-  }, [showMsg]);
+    syncRoomState({ floor: f, anomalies: anoms, foundAnomaly: false, monster: { x: 0, y: 0, active: false } });
+    startSpawnCountdown();
+  }, [showMsg, killMonsterTimers, startSpawnCountdown, syncRoomState]);
 
   const resetToTop = useCallback(() => {
+    killMonsterTimers();
     setMonster({ x: 0, y: 0, active: false });
-    setStepCount(0);
     const anoms = generateAnomalies();
-    setFloor(MAX_FLOOR);
-    setClearedFloors(new Set());
-    setAnomalies(anoms);
-    setPlayer({ x: 9, y: 7, hiding: false });
-    setFoundAnomaly(false);
+    setFloor(MAX_FLOOR); setClearedFloors(new Set()); setAnomalies(anoms);
+    setPlayer({ x: 9, y: 7, hiding: false }); setFoundAnomaly(false);
     showMsg(`СБРОС — ЭТАЖ ${MAX_FLOOR}`, 2800);
-  }, [showMsg]);
+    syncRoomState({ floor: MAX_FLOOR, anomalies: anoms, foundAnomaly: false, monster: { x: 0, y: 0, active: false }, clearedFloors: [] });
+    startSpawnCountdown();
+  }, [showMsg, killMonsterTimers, startSpawnCountdown, syncRoomState]);
 
   const startGame = useCallback(() => {
+    killMonsterTimers();
     const anoms = generateAnomalies();
-    setFloor(MAX_FLOOR);
-    setAnomalies(anoms);
+    setFloor(MAX_FLOOR); setAnomalies(anoms);
     setPlayer({ x: 9, y: 7, hiding: false });
-    setWin(false); setFlashing(false);
-    setFoundAnomaly(false); setMessage(""); setDead(false);
-    setMonster({ x: 0, y: 0, active: false });
-    setStepCount(0);
+    setWin(false); setFlashing(false); setFoundAnomaly(false);
+    setMessage(""); setDead(false); setMonster({ x: 0, y: 0, active: false });
     setClearedFloors(new Set());
     setScreen("game");
     showMsg(`▶ ЭТАЖ ${MAX_FLOOR} — НАЧИНАЕМ МИССИЮ`, 3000);
-  }, [showMsg]);
+    startSpawnCountdown();
+  }, [showMsg, killMonsterTimers, startSpawnCountdown]);
 
-  // ЛИФТ: ВВЕРХ = зафиксировал аномалию → отчёт наверх (отчитываемся)
-  //        ВНИЗ  = переходим на следующий этаж вниз (миссия вниз с 8 до 1)
+  // ── LIFT ──
   const activateLift = useCallback((direction: "up" | "down") => {
     const { floor: curFloor, player: curPlayer, anomalies: curAnomalies, foundAnomaly: curFound, clearedFloors: cleared } = stateRef.current;
     const liftCol = 17, liftRow = 7;
     if (Math.abs(curPlayer.x - liftCol) > 2 || Math.abs(curPlayer.y - liftRow) > 2) {
-      showMsg("Подойди к лифту (правая сторона)", 2000);
-      return;
+      showMsg("Подойди к лифту (правая сторона)", 2000); return;
     }
-
     if (direction === "up") {
-      // ВВЕРХ = сообщить об аномалии — требует найденной аномалии
       if (!curFound) {
-        if (curAnomalies.length === 0) {
-          showMsg("❌ НА ЭТАЖЕ ЧИСТО — используй ВНИЗ [F]", 2500);
-        } else {
-          showMsg("Сначала найди аномалию — нажми [E] рядом с ней", 2500);
-        }
+        showMsg(curAnomalies.length === 0 ? "❌ НА ЭТАЖЕ ЧИСТО — используй ВНИЗ [F]" : "Сначала найди аномалию — нажми [E]", 2500);
         return;
       }
-      // Зафиксировали — зарабатываем токен, идём ВНИЗ (следующий этаж)
       const newCleared = new Set(cleared).add(curFloor);
       setClearedFloors(newCleared);
       setTokens(t => t + 1);
       playLift();
-      if (curFloor <= 1) {
-        playSuccess(); setWin(true); return;
-      }
-      showMsg(`✓ АНОМАЛИЯ ЗАФИКСИРОВАНА +1 ТОКЕН — ЭТАЖ ${curFloor - 1}`, 2200);
+      if (curFloor <= 1) { playSuccess(); setWin(true); return; }
+      showMsg(`✓ ЗАФИКСИРОВАНО +1🪙 — ЭТАЖ ${curFloor - 1}`, 2200);
       goToFloor(curFloor - 1);
-
     } else {
-      // ВНИЗ = спуститься без фиксации (только если этаж чист)
       if (curAnomalies.length > 0 && !curFound) {
-        showMsg("❌ АНОМАЛИЯ НЕ ЗАФИКСИРОВАНА! Используй [Q] после осмотра", 3000);
+        showMsg("❌ АНОМАЛИЯ НЕ ЗАФИКСИРОВАНА!", 3000);
         setFlashing(true); playAnomaly();
         setTimeout(() => { setFlashing(false); resetToTop(); }, 1200);
         return;
       }
-      // Этаж чист (аномалий нет) — просто едем вниз
       const newCleared = new Set(cleared).add(curFloor);
       setClearedFloors(newCleared);
       playLift();
-      if (curFloor <= 1) {
-        playSuccess(); setWin(true); return;
-      }
+      if (curFloor <= 1) { playSuccess(); setWin(true); return; }
       showMsg(`▶ ЭТАЖ ЧИСТ — ЕДЕМ НА ${curFloor - 1}`, 2000);
       goToFloor(curFloor - 1);
     }
   }, [showMsg, playAnomaly, playLift, playSuccess, goToFloor, resetToTop]);
 
+  // ── INSPECT ──
   const inspect = useCallback(() => {
-    const { player: curPlayer, anomalies: curAnomalies } = stateRef.current;
-    const nearby = curAnomalies.find(a =>
-      Math.abs(a.x - curPlayer.x) <= 1 && Math.abs(a.y - curPlayer.y) <= 1
-    );
+    const { player: p, anomalies: a } = stateRef.current;
+    const nearby = a.find(an => Math.abs(an.x - p.x) <= 1 && Math.abs(an.y - p.y) <= 1);
     if (nearby) {
-      setFoundAnomaly(true);
-      playAnomaly();
-      setFlashing(true);
+      setFoundAnomaly(true); playAnomaly(); setFlashing(true);
       showMsg(`▶ АНОМАЛИЯ: ${ANOMALY_DATA[nearby.type].label} — Жми [Q] у лифта`, 4000);
       setTimeout(() => setFlashing(false), 500);
-      setAnomalies(prev => prev.map(a => a.id === nearby.id ? { ...a, visible: true } : a));
+      const updated = stateRef.current.anomalies.map(an => an.id === nearby.id ? { ...an, visible: true } : an);
+      setAnomalies(updated);
+      syncRoomState({ anomalies: updated, foundAnomaly: true });
     } else {
       playTone(200, 0.06, "square", 0.05);
       showMsg("Здесь ничего нет.", 1500);
     }
-  }, [playAnomaly, playTone, showMsg]);
+  }, [playAnomaly, playTone, showMsg, syncRoomState]);
 
+  // ── MOVE (with smooth animation trigger via CSS) ──
   const movePlayer = useCallback((dir: Direction) => {
     const { dead: isDead } = stateRef.current;
     if (isDead) return;
-
-    let moved = false;
     setPlayer(prev => {
       let nx = prev.x, ny = prev.y;
-      if (dir === "left") nx--;
-      if (dir === "right") nx++;
-      if (dir === "up") ny--;
-      if (dir === "down") ny++;
+      if (dir === "left") nx--; if (dir === "right") nx++;
+      if (dir === "up")   ny--; if (dir === "down")  ny++;
       if (!isWalkable(nx, ny)) return prev;
-      moved = true;
       playStep();
-      return { x: nx, y: ny, hiding: false };
+      const next = { x: nx, y: ny, hiding: false };
+      syncPlayerPos(next);
+      return next;
     });
+  }, [playStep, syncPlayerPos]);
 
-    // After a valid move: increment step counter, spawn or move monster
-    setTimeout(() => {
-      if (!moved) return;
-      const { monster: m, dead: isDead2, upgrades: upg } = stateRef.current;
-      const monsterDelay = BATTERY_LEVELS[upg.batteryLevel] ?? MONSTER_STEPS_DELAY;
-
-      setStepCount(prev => {
-        const next = prev + 1;
-        if (!m.active && next >= monsterDelay) {
-          spawnMonster();
-        }
+  // ── HIDE IN CABINET ──
+  const hideInCabinet = useCallback(() => {
+    const { player: p, dead: isDead } = stateRef.current;
+    if (isDead) return;
+    const near = [{ x: p.x-1, y: p.y }, { x: p.x+1, y: p.y }, { x: p.x, y: p.y-1 }, { x: p.x, y: p.y+1 }]
+      .some(q => q.x >= 0 && q.y >= 0 && q.x < MAP_COLS && q.y < MAP_ROWS && BASE_MAP[q.y][q.x] === T_CABINET);
+    if (near) {
+      setPlayer(prev => {
+        const next = { ...prev, hiding: !prev.hiding };
+        syncPlayerPos(next);
         return next;
       });
-
-      if (m.active && !isDead2) {
-        moveMonsterOneStep();
-      }
-
-      // Check collision after player moved
-      const { player: p, monster: m2, dead: isDead3 } = stateRef.current;
-      if (!isDead3 && m2.active && !p.hiding && BASE_MAP[p.y][p.x] !== T_ELEVATOR) {
-        if (m2.x === p.x && m2.y === p.y) {
-          setDead(true);
-          playScream();
-          showMsg("☠ СХВАЧЕН! Нажми R для рестарта", 99999);
-        }
-      }
-    }, 30);
-  }, [playStep, playScream, showMsg, spawnMonster, moveMonsterOneStep]);
-
-  const hideInCabinet = useCallback(() => {
-    const { player: curPlayer, dead: isDead } = stateRef.current;
-    if (isDead) return;
-    const nearCabinet = [
-      { x: curPlayer.x - 1, y: curPlayer.y },
-      { x: curPlayer.x + 1, y: curPlayer.y },
-      { x: curPlayer.x, y: curPlayer.y - 1 },
-      { x: curPlayer.x, y: curPlayer.y + 1 },
-    ].some(p => p.x >= 0 && p.y >= 0 && p.x < MAP_COLS && p.y < MAP_ROWS && BASE_MAP[p.y][p.x] === T_CABINET);
-
-    if (nearCabinet) {
-      setPlayer(prev => ({ ...prev, hiding: !prev.hiding }));
       showMsg(stateRef.current.player.hiding ? "Вышел из укрытия" : "🫥 В шкафу — монстр не найдёт", 2500);
     } else {
       showMsg("Нет шкафа рядом", 1200);
     }
-  }, [showMsg]);
+  }, [showMsg, syncPlayerPos]);
 
+  // ── KEYBOARD ──
   useEffect(() => {
     if (screen !== "game") return;
     const handler = (e: KeyboardEvent) => {
@@ -442,42 +450,76 @@ export default function Index() {
     return () => window.removeEventListener("keydown", handler);
   }, [screen, movePlayer, inspect, activateLift, win, startGame, hideInCabinet]);
 
-  if (screen === "menu") return <MenuScreen onStart={startGame} onSettings={() => setScreen("settings")} />;
+  useEffect(() => () => { killMonsterTimers(); stopPolling(); }, [killMonsterTimers, stopPolling]);
+
+  // ── MULTIPLAYER HANDLERS ──
+  const createRoom = useCallback(async (name: string) => {
+    const res = await fetch(`${GAME_URL}/?action=create`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    const m: MultiState = { roomId: data.roomId, playerId: data.playerId, playerName: name, playerColor: data.color, isHost: true };
+    setMulti(m);
+    startPolling(data.roomId, data.playerId);
+    heartbeatTimer.current = setInterval(() => {
+      fetch(`${GAME_URL}/?action=heartbeat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ roomId: data.roomId, playerId: data.playerId }) }).catch(() => {});
+    }, 2000);
+    startGame();
+  }, [startGame, startPolling]);
+
+  const joinRoom = useCallback(async (roomId: string, name: string) => {
+    const res = await fetch(`${GAME_URL}/?action=join`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roomId, name }),
+    });
+    const data = await res.json();
+    if (data.error) { showMsg("❌ Комната не найдена", 3000); return; }
+    const m: MultiState = { roomId: data.roomId, playerId: data.playerId, playerName: name, playerColor: data.color, isHost: false };
+    setMulti(m);
+    startPolling(data.roomId, data.playerId);
+    heartbeatTimer.current = setInterval(() => {
+      fetch(`${GAME_URL}/?action=heartbeat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ roomId: data.roomId, playerId: data.playerId }) }).catch(() => {});
+    }, 2000);
+    startGame();
+  }, [showMsg, startGame, startPolling]);
+
+  // ── SCREEN ROUTING ──
+  const monsterDelay = BATTERY_LEVELS[upgrades.batteryLevel] ?? 20;
+  void monsterDelay;
+
+  if (screen === "menu")     return <MenuScreen onStart={startGame} onSettings={() => setScreen("settings")} onLobby={() => setScreen("lobby")} />;
   if (screen === "settings") return <SettingsScreen settings={settings} setSettings={setSettings} onBack={() => setScreen("menu")} />;
-  if (screen === "shop") return (
-    <ShopScreen
-      tokens={tokens} upgrades={upgrades}
+  if (screen === "lobby")    return <LobbyScreen onCreate={createRoom} onJoin={joinRoom} onBack={() => setScreen("menu")} />;
+  if (screen === "shop")     return (
+    <ShopScreen tokens={tokens} upgrades={upgrades}
       onBuy={(type) => {
         const { upgrades: upg } = stateRef.current;
         if (type === "vision") {
-          const nextLv = upg.visionLevel + 1;
-          if (nextLv >= VISION_LEVELS.length) return;
-          const cost = UPGRADE_COSTS.vision[nextLv];
-          if (tokens < cost) { return; }
-          setTokens(t => t - cost);
-          setUpgrades(u => ({ ...u, visionLevel: nextLv }));
+          const lv = upg.visionLevel + 1;
+          if (lv >= VISION_LEVELS.length) return;
+          const cost = UPGRADE_COSTS.vision[lv];
+          if (tokens < cost) return;
+          setTokens(t => t - cost); setUpgrades(u => ({ ...u, visionLevel: lv }));
         } else {
-          const nextLv = upg.batteryLevel + 1;
-          if (nextLv >= BATTERY_LEVELS.length) return;
-          const cost = UPGRADE_COSTS.battery[nextLv];
-          if (tokens < cost) { return; }
-          setTokens(t => t - cost);
-          setUpgrades(u => ({ ...u, batteryLevel: nextLv }));
+          const lv = upg.batteryLevel + 1;
+          if (lv >= BATTERY_LEVELS.length) return;
+          const cost = UPGRADE_COSTS.battery[lv];
+          if (tokens < cost) return;
+          setTokens(t => t - cost); setUpgrades(u => ({ ...u, batteryLevel: lv }));
         }
       }}
       onBack={() => setScreen("game")}
     />
   );
 
-  const monsterDelay = BATTERY_LEVELS[upgrades.batteryLevel] ?? MONSTER_STEPS_DELAY;
-
   return (
     <GameScreen
       floor={floor} player={player} anomalies={anomalies} message={message}
       flashing={flashing} win={win} settings={settings} foundAnomaly={foundAnomaly}
       monster={monster} dead={dead} visibleTiles={visibleTiles}
-      stepCount={stepCount} monsterDelay={monsterDelay}
-      tokens={tokens} upgrades={upgrades}
+      spawnCountdown={spawnCountdown} tokens={tokens} upgrades={upgrades}
+      netPlayers={netPlayers} multi={multi}
       onMove={movePlayer} onInspect={inspect}
       onLiftUp={() => activateLift("up")} onLiftDown={() => activateLift("down")}
       onHide={hideInCabinet}
@@ -487,131 +529,76 @@ export default function Index() {
   );
 }
 
-// ─── SHOP ────────────────────────────────────────────────────────────────────
-
-function ShopScreen({ tokens, upgrades, onBuy, onBack }: {
-  tokens: number;
-  upgrades: Upgrades;
-  onBuy: (type: "vision" | "battery") => void;
+// ─── LOBBY ────────────────────────────────────────────────────────────────────
+function LobbyScreen({ onCreate, onJoin, onBack }: {
+  onCreate: (name: string) => void;
+  onJoin: (roomId: string, name: string) => void;
   onBack: () => void;
 }) {
-  const visionNextLv = upgrades.visionLevel + 1;
-  const batteryNextLv = upgrades.batteryLevel + 1;
-  const visionMaxed = visionNextLv >= VISION_LEVELS.length;
-  const batteryMaxed = batteryNextLv >= BATTERY_LEVELS.length;
-  const visionCost = visionMaxed ? 0 : UPGRADE_COSTS.vision[visionNextLv];
-  const batteryCost = batteryMaxed ? 0 : UPGRADE_COSTS.battery[batteryNextLv];
+  const [name, setName]     = useState("АГЕНТ");
+  const [roomId, setRoomId] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [tab, setTab]       = useState<"create" | "join">("create");
+
+  const handleCreate = async () => { setLoading(true); await onCreate(name); setLoading(false); };
+  const handleJoin   = async () => { setLoading(true); await onJoin(roomId.toUpperCase(), name); setLoading(false); };
 
   return (
     <div style={{
       width: "100vw", height: "100vh", background: "#000",
       display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      fontFamily: "'Press Start 2P', monospace", color: "#00ff88",
-      position: "relative", overflow: "hidden",
+      fontFamily: "'Press Start 2P', monospace", color: "#00ff88", userSelect: "none",
     }}>
-      <div style={{
-        position: "absolute", inset: 0, pointerEvents: "none",
-        backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 31px,rgba(0,255,136,0.025) 31px,rgba(0,255,136,0.025) 32px)",
-      }} />
+      <div style={{ fontSize: 7, color: "#226622", marginBottom: 10, letterSpacing: 4 }}>▓▓▓ МУЛЬТИПЛЕЕР ▓▓▓</div>
 
-      <div style={{ fontSize: 7, color: "#226622", marginBottom: 8, letterSpacing: 4 }}>▓▓▓ МАГАЗИН ▓▓▓</div>
-      <div style={{ fontSize: 9, color: "#ff9900", marginBottom: 32, letterSpacing: 2 }}>
-        ТОКЕНЫ: <span style={{ color: "#fff", textShadow: "0 0 8px #ff990066" }}>{tokens}</span>
+      <div style={{ display: "flex", gap: 0, marginBottom: 24 }}>
+        {(["create", "join"] as const).map(t => (
+          <button key={t} onClick={() => setTab(t)} style={{
+            fontFamily: "'Press Start 2P', monospace", fontSize: 8, padding: "8px 18px",
+            background: tab === t ? "#00ff88" : "#080808",
+            color: tab === t ? "#000" : "#446644",
+            border: "2px solid #226622", cursor: "pointer",
+          }}>{t === "create" ? "СОЗДАТЬ" : "ВОЙТИ"}</button>
+        ))}
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 20, width: 340 }}>
-        {/* Фонарик */}
-        <ShopItem
-          icon="🔦"
-          title="ФОНАРИК"
-          desc={visionMaxed
-            ? "МАКСИМАЛЬНЫЙ УРОВЕНЬ"
-            : `Радиус: ${VISION_LEVELS[upgrades.visionLevel]} → ${VISION_LEVELS[visionNextLv]} клеток`}
-          level={upgrades.visionLevel}
-          maxLevel={VISION_LEVELS.length - 1}
-          cost={visionCost}
-          tokens={tokens}
-          maxed={visionMaxed}
-          onBuy={() => onBuy("vision")}
-        />
-        {/* Батарейка */}
-        <ShopItem
-          icon="🔋"
-          title="БАТАРЕЙКА"
-          desc={batteryMaxed
-            ? "МАКСИМАЛЬНЫЙ УРОВЕНЬ"
-            : `Шагов до монстра: ${BATTERY_LEVELS[upgrades.batteryLevel]} → ${BATTERY_LEVELS[batteryNextLv]}`}
-          level={upgrades.batteryLevel}
-          maxLevel={BATTERY_LEVELS.length - 1}
-          cost={batteryCost}
-          tokens={tokens}
-          maxed={batteryMaxed}
-          onBuy={() => onBuy("battery")}
-        />
-      </div>
-
-      <div style={{ marginTop: 36 }}>
-        <PixelBtn onClick={onBack} color="#ff9900">← ВЕРНУТЬСЯ</PixelBtn>
-      </div>
-      <div style={{ position: "absolute", bottom: 16, fontSize: 6, color: "#1a3322" }}>
-        ТОКЕНЫ ЗАРАБАТЫВАЮТСЯ ЗА КАЖДЫЙ ПРОЙДЁННЫЙ ЭТАЖ
-      </div>
-    </div>
-  );
-}
-
-function ShopItem({ icon, title, desc, level, maxLevel, cost, tokens, maxed, onBuy }: {
-  icon: string; title: string; desc: string;
-  level: number; maxLevel: number; cost: number; tokens: number;
-  maxed: boolean; onBuy: () => void;
-}) {
-  const canAfford = tokens >= cost && !maxed;
-  return (
-    <div style={{
-      border: `2px solid ${maxed ? "#226622" : "#334433"}`,
-      padding: "14px 18px",
-      display: "flex", flexDirection: "column", gap: 8,
-      background: "#050a05",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <span style={{ fontSize: 11, color: "#aaa" }}>{icon} {title}</span>
-        <div style={{ display: "flex", gap: 3 }}>
-          {Array.from({ length: maxLevel }).map((_, i) => (
-            <div key={i} style={{
-              width: 10, height: 6,
-              background: i < level ? "#00ff88" : "#111",
-              border: "1px solid #224422",
-            }} />
-          ))}
+      <div style={{ display: "flex", flexDirection: "column", gap: 14, width: 280 }}>
+        <div>
+          <div style={{ fontSize: 7, color: "#446644", marginBottom: 6 }}>ИМЯ АГЕНТА</div>
+          <input value={name} onChange={e => setName(e.target.value.toUpperCase().slice(0, 12))}
+            style={{ width: "100%", fontFamily: "'Press Start 2P', monospace", fontSize: 9,
+              background: "#050a05", color: "#00ff88", border: "2px solid #226622",
+              padding: "8px", outline: "none", boxSizing: "border-box" }} />
         </div>
+
+        {tab === "join" && (
+          <div>
+            <div style={{ fontSize: 7, color: "#446644", marginBottom: 6 }}>КОД КОМНАТЫ</div>
+            <input value={roomId} onChange={e => setRoomId(e.target.value.toUpperCase().slice(0, 6))}
+              placeholder="XXXXXX"
+              style={{ width: "100%", fontFamily: "'Press Start 2P', monospace", fontSize: 12,
+                background: "#050a05", color: "#ff9900", border: "2px solid #226622",
+                padding: "8px", outline: "none", boxSizing: "border-box", letterSpacing: 4 }} />
+          </div>
+        )}
+
+        <PixelBtn onClick={tab === "create" ? handleCreate : handleJoin}
+          color="#00ff88">
+          {loading ? "..." : tab === "create" ? "▶ СОЗДАТЬ КОМНАТУ" : "▶ ВОЙТИ"}
+        </PixelBtn>
       </div>
-      <div style={{ fontSize: 7, color: "#446644" }}>{desc}</div>
-      <button
-        onClick={onBuy}
-        disabled={!canAfford}
-        style={{
-          fontFamily: "'Press Start 2P', monospace",
-          fontSize: 8, padding: "8px 0",
-          background: maxed ? "#0a180a" : canAfford ? "#00ff88" : "#0f1a0f",
-          color: maxed ? "#226622" : canAfford ? "#000" : "#224422",
-          border: `2px solid ${maxed ? "#1a3a1a" : canAfford ? "#00ff88" : "#1a3a1a"}`,
-          cursor: canAfford ? "pointer" : "default",
-        }}
-      >
-        {maxed ? "УЛУЧШЕНО" : `КУПИТЬ — ${cost} ТОКЕН${cost === 1 ? "" : "А"}`}
-      </button>
+
+      <div style={{ marginTop: 28 }}>
+        <PixelBtn onClick={onBack} color="#ff9900">← НАЗАД</PixelBtn>
+      </div>
     </div>
   );
 }
 
 // ─── MENU ────────────────────────────────────────────────────────────────────
-
-function MenuScreen({ onStart, onSettings }: { onStart: () => void; onSettings: () => void }) {
+function MenuScreen({ onStart, onSettings, onLobby }: { onStart: () => void; onSettings: () => void; onLobby: () => void }) {
   const [blink, setBlink] = useState(true);
-  useEffect(() => {
-    const t = setInterval(() => setBlink(b => !b), 550);
-    return () => clearInterval(t);
-  }, []);
+  useEffect(() => { const t = setInterval(() => setBlink(b => !b), 550); return () => clearInterval(t); }, []);
 
   return (
     <div style={{
@@ -620,36 +607,29 @@ function MenuScreen({ onStart, onSettings }: { onStart: () => void; onSettings: 
       fontFamily: "'Press Start 2P', monospace", color: "#00ff88",
       position: "relative", overflow: "hidden", userSelect: "none",
     }}>
-      <div style={{
-        position: "absolute", inset: 0, pointerEvents: "none",
-        backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 31px,rgba(0,255,136,0.03) 31px,rgba(0,255,136,0.03) 32px)",
-      }} />
-      <div style={{
-        position: "absolute", inset: 0, pointerEvents: "none",
-        background: "radial-gradient(ellipse at 50% 120%, rgba(0,60,20,0.55) 0%, transparent 60%)",
-      }} />
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none",
+        backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 31px,rgba(0,255,136,0.03) 31px,rgba(0,255,136,0.03) 32px)" }} />
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none",
+        background: "radial-gradient(ellipse at 50% 120%, rgba(0,60,20,0.55) 0%, transparent 60%)" }} />
 
-      <div style={{ fontSize: 7, color: "#ff336677", marginBottom: 12, letterSpacing: 6 }}>▓▓▓ ELEVATOR PROTOCOL v2.0 ▓▓▓</div>
-      <h1 style={{
-        fontSize: "clamp(28px,5vw,52px)", textAlign: "center", lineHeight: 1.4, marginBottom: 8,
-        textShadow: "0 0 20px #00ff88, 0 0 50px #00ff4444",
-      }}>ЛИФТ</h1>
-      <div style={{ fontSize: 9, color: "#ff9900", marginBottom: 44, letterSpacing: 3, textShadow: "0 0 8px #ff990055" }}>
+      <div style={{ fontSize: 7, color: "#ff336677", marginBottom: 12, letterSpacing: 6 }}>▓▓▓ ELEVATOR PROTOCOL v2.1 ▓▓▓</div>
+      <h1 style={{ fontSize: "clamp(28px,5vw,52px)", textAlign: "center", lineHeight: 1.4, marginBottom: 8,
+        textShadow: "0 0 20px #00ff88, 0 0 50px #00ff4444" }}>ЛИФТ</h1>
+      <div style={{ fontSize: 9, color: "#ff9900", marginBottom: 36, letterSpacing: 3, textShadow: "0 0 8px #ff990055" }}>
         ОХОТНИК ЗА АНОМАЛИЯМИ
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 14, alignItems: "center", marginBottom: 44 }}>
-        <PixelBtn onClick={onStart} color="#00ff88">▶  НАЧАТЬ  ИГРУ</PixelBtn>
-        <PixelBtn onClick={onSettings} color="#4488ff">⚙  НАСТРОЙКИ</PixelBtn>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14, alignItems: "center", marginBottom: 36 }}>
+        <PixelBtn onClick={onStart} color="#00ff88">▶  ОДИНОЧНАЯ</PixelBtn>
+        <PixelBtn onClick={onLobby} color="#4488ff">👥 МУЛЬТИПЛЕЕР</PixelBtn>
+        <PixelBtn onClick={onSettings} color="#ff9900">⚙  НАСТРОЙКИ</PixelBtn>
       </div>
 
-      <div style={{ fontSize: 6, color: "#335533", textAlign: "center", lineHeight: 2.8, minHeight: 60 }}>
+      <div style={{ fontSize: 6, color: "#335533", textAlign: "center", lineHeight: 2.8 }}>
         {blink ? "[ WASD / СТРЕЛКИ — ДВИЖЕНИЕ ]" : <span style={{ opacity: 0 }}>X</span>}<br/>
-        [ E — ОСМОТР ]  [ H — ШКАФ ]<br/>
-        [ Q — ЛИФТ (аномалия найдена) ]<br/>
-        [ F — ЛИФТ (этаж чист) ]  [ P — МАГАЗИН ]
+        [ E — ОСМОТР ]  [ H — ШКАФ ]  [ P — МАГАЗИН ]<br/>
+        [ Q — ЛИФТ (аномалия) ]  [ F — ЛИФТ (чисто) ]
       </div>
-
       <div style={{ position: "absolute", bottom: 18, fontSize: 6, color: "#1a3322", textAlign: "center" }}>
         МИССИЯ: СПУСТИСЬ С ЭТАЖА 8 НА ЭТАЖ 1 ✦ ИЗБЕГАЙ МОНСТРА ✦ ПРЯЧЬСЯ В ШКАФАХ
       </div>
@@ -658,18 +638,13 @@ function MenuScreen({ onStart, onSettings }: { onStart: () => void; onSettings: 
 }
 
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
-
 function SettingsScreen({ settings, setSettings, onBack }: {
-  settings: Settings;
-  setSettings: React.Dispatch<React.SetStateAction<Settings>>;
-  onBack: () => void;
+  settings: Settings; setSettings: React.Dispatch<React.SetStateAction<Settings>>; onBack: () => void;
 }) {
   return (
-    <div style={{
-      width: "100vw", height: "100vh", background: "#000",
+    <div style={{ width: "100vw", height: "100vh", background: "#000",
       display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      fontFamily: "'Press Start 2P', monospace", color: "#00ff88",
-    }}>
+      fontFamily: "'Press Start 2P', monospace", color: "#00ff88" }}>
       <div style={{ fontSize: 7, color: "#336644", marginBottom: 12, letterSpacing: 4 }}>▓▓▓ НАСТРОЙКИ ▓▓▓</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 22, minWidth: 300, marginBottom: 44 }}>
         {([ ["ЗВУКИ", "sfx"], ["CRT ЭФФЕКТ", "crt"], ["СКАНЛАЙНЫ", "scanlines"] ] as [string, keyof Settings][]).map(([label, key]) => (
@@ -677,10 +652,8 @@ function SettingsScreen({ settings, setSettings, onBack }: {
             <span style={{ fontSize: 8, color: "#aaa" }}>{label}</span>
             <button onClick={() => setSettings(s => ({ ...s, [key]: !s[key] }))} style={{
               fontFamily: "'Press Start 2P', monospace", fontSize: 8, padding: "7px 14px",
-              background: settings[key] ? "#00ff88" : "#111",
-              color: settings[key] ? "#000" : "#444",
-              border: `2px solid ${settings[key] ? "#00ff88" : "#333"}`,
-              cursor: "pointer",
+              background: settings[key] ? "#00ff88" : "#111", color: settings[key] ? "#000" : "#444",
+              border: `2px solid ${settings[key] ? "#00ff88" : "#333"}`, cursor: "pointer",
             }}>{settings[key] ? "ВКЛ" : "ВЫКЛ"}</button>
           </div>
         ))}
@@ -690,36 +663,112 @@ function SettingsScreen({ settings, setSettings, onBack }: {
   );
 }
 
-// ─── PIXEL BTN ───────────────────────────────────────────────────────────────
-
-function PixelBtn({ onClick, children, color }: { onClick: () => void; children: React.ReactNode; color: string }) {
-  const [hover, setHover] = useState(false);
+// ─── SHOP ────────────────────────────────────────────────────────────────────
+function ShopScreen({ tokens, upgrades, onBuy, onBack }: {
+  tokens: number; upgrades: Upgrades; onBuy: (t: "vision"|"battery") => void; onBack: () => void;
+}) {
+  const vLv = upgrades.visionLevel, bLv = upgrades.batteryLevel;
+  const vMax = vLv + 1 >= VISION_LEVELS.length, bMax = bLv + 1 >= BATTERY_LEVELS.length;
   return (
-    <button
-      onClick={onClick}
-      onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
-      style={{
-        fontFamily: "'Press Start 2P', monospace", fontSize: 10, padding: "13px 28px",
-        background: hover ? color : "transparent", color: hover ? "#000" : color,
-        border: `3px solid ${color}`, cursor: "pointer",
-        boxShadow: hover ? `0 0 22px ${color}66` : "none",
-        transition: "all 0.08s", letterSpacing: 1,
-      }}
-    >{children}</button>
+    <div style={{ width: "100vw", height: "100vh", background: "#000",
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+      fontFamily: "'Press Start 2P', monospace", color: "#00ff88", position: "relative", overflow: "hidden" }}>
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none",
+        backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 31px,rgba(0,255,136,0.025) 31px,rgba(0,255,136,0.025) 32px)" }} />
+      <div style={{ fontSize: 7, color: "#226622", marginBottom: 8, letterSpacing: 4 }}>▓▓▓ МАГАЗИН ▓▓▓</div>
+      <div style={{ fontSize: 9, color: "#ff9900", marginBottom: 32 }}>ТОКЕНЫ: <span style={{ color: "#fff" }}>{tokens}</span></div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 20, width: 340 }}>
+        <ShopItem icon="🔦" title="ФОНАРИК"
+          desc={vMax ? "МАКСИМУМ" : `Радиус: ${VISION_LEVELS[vLv]} → ${VISION_LEVELS[vLv+1]} клеток`}
+          level={vLv} maxLevel={VISION_LEVELS.length-1}
+          cost={vMax ? 0 : UPGRADE_COSTS.vision[vLv+1]} tokens={tokens} maxed={vMax}
+          onBuy={() => onBuy("vision")} />
+        <ShopItem icon="🔋" title="БАТАРЕЙКА"
+          desc={bMax ? "МАКСИМУМ" : `Шагов до монстра: ${BATTERY_LEVELS[bLv]} → ${BATTERY_LEVELS[bLv+1]}`}
+          level={bLv} maxLevel={BATTERY_LEVELS.length-1}
+          cost={bMax ? 0 : UPGRADE_COSTS.battery[bLv+1]} tokens={tokens} maxed={bMax}
+          onBuy={() => onBuy("battery")} />
+      </div>
+      <div style={{ marginTop: 36 }}><PixelBtn onClick={onBack} color="#ff9900">← ВЕРНУТЬСЯ</PixelBtn></div>
+    </div>
   );
 }
 
-// ─── GAME SCREEN ─────────────────────────────────────────────────────────────
+function ShopItem({ icon, title, desc, level, maxLevel, cost, tokens, maxed, onBuy }: {
+  icon: string; title: string; desc: string; level: number; maxLevel: number;
+  cost: number; tokens: number; maxed: boolean; onBuy: () => void;
+}) {
+  const canAfford = tokens >= cost && !maxed;
+  return (
+    <div style={{ border: `2px solid ${maxed ? "#226622" : "#334433"}`, padding: "14px 18px",
+      display: "flex", flexDirection: "column", gap: 8, background: "#050a05" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ fontSize: 11, color: "#aaa" }}>{icon} {title}</span>
+        <div style={{ display: "flex", gap: 3 }}>
+          {Array.from({ length: maxLevel }).map((_, i) => (
+            <div key={i} style={{ width: 10, height: 6, background: i < level ? "#00ff88" : "#111", border: "1px solid #224422" }} />
+          ))}
+        </div>
+      </div>
+      <div style={{ fontSize: 7, color: "#446644" }}>{desc}</div>
+      <button onClick={onBuy} disabled={!canAfford} style={{
+        fontFamily: "'Press Start 2P', monospace", fontSize: 8, padding: "8px 0",
+        background: maxed ? "#0a180a" : canAfford ? "#00ff88" : "#0f1a0f",
+        color: maxed ? "#226622" : canAfford ? "#000" : "#224422",
+        border: `2px solid ${maxed ? "#1a3a1a" : canAfford ? "#00ff88" : "#1a3a1a"}`,
+        cursor: canAfford ? "pointer" : "default",
+      }}>{maxed ? "УЛУЧШЕНО" : `КУПИТЬ — ${cost}🪙`}</button>
+    </div>
+  );
+}
 
+// ─── PIXEL BTN ────────────────────────────────────────────────────────────────
+function PixelBtn({ onClick, children, color }: { onClick: () => void; children: React.ReactNode; color: string }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button onClick={onClick} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 10, padding: "13px 28px",
+        background: hover ? color : "transparent", color: hover ? "#000" : color,
+        border: `3px solid ${color}`, cursor: "pointer",
+        boxShadow: hover ? `0 0 22px ${color}66` : "none", transition: "all 0.08s", letterSpacing: 1 }}>
+      {children}
+    </button>
+  );
+}
+
+// ─── ANIMATED SPRITE ─────────────────────────────────────────────────────────
+// Renders entity at (x, y) with CSS transform for smooth movement
+function AnimSprite({ x, y, cellSize, zIndex, children }: {
+  x: number; y: number; cellSize: number; zIndex: number; children: React.ReactNode;
+}) {
+  return (
+    <div style={{
+      position: "absolute",
+      left: 0, top: 0,
+      width: cellSize, height: cellSize,
+      transform: `translate(${x * cellSize}px, ${y * cellSize}px)`,
+      transition: `transform ${ANIM_MS}ms linear`,
+      zIndex,
+      display: "flex", alignItems: "center", justifyContent: "center",
+      pointerEvents: "none",
+    }}>
+      {children}
+    </div>
+  );
+}
+
+// ─── GAME SCREEN ──────────────────────────────────────────────────────────────
 function GameScreen({
   floor, player, anomalies, message, flashing, win, settings, foundAnomaly,
-  monster, dead, visibleTiles, stepCount, monsterDelay, tokens, upgrades,
+  monster, dead, visibleTiles, spawnCountdown, tokens, upgrades,
+  netPlayers, multi,
   onMove, onInspect, onLiftUp, onLiftDown, onHide, onMenu, onRestart, onShop,
 }: {
   floor: number; player: Player; anomalies: Anomaly[]; message: string;
   flashing: boolean; win: boolean; settings: Settings; foundAnomaly: boolean;
   monster: Monster; dead: boolean; visibleTiles: Set<string>;
-  stepCount: number; monsterDelay: number; tokens: number; upgrades: Upgrades;
+  spawnCountdown: number; tokens: number; upgrades: Upgrades;
+  netPlayers: NetPlayer[]; multi: MultiState | null;
   onMove: (d: Direction) => void; onInspect: () => void;
   onLiftUp: () => void; onLiftDown: () => void; onHide: () => void;
   onMenu: () => void; onRestart: () => void; onShop: () => void;
@@ -728,16 +777,12 @@ function GameScreen({
 
   useEffect(() => {
     const calc = () => {
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
       const panelW = 190;
-      const availW = vw - panelW - 24;
-      const availH = vh - 60 - 44 - 100;
-      const cs = Math.floor(Math.min(availW / MAP_COLS, availH / MAP_ROWS));
-      setCellSize(Math.max(14, Math.min(cs, 40)));
+      const availW = window.innerWidth - panelW - 24;
+      const availH = window.innerHeight - 56 - 40 - 90;
+      setCellSize(Math.max(14, Math.min(Math.floor(Math.min(availW / MAP_COLS, availH / MAP_ROWS)), 40)));
     };
-    calc();
-    window.addEventListener("resize", calc);
+    calc(); window.addEventListener("resize", calc);
     return () => window.removeEventListener("resize", calc);
   }, []);
 
@@ -745,179 +790,160 @@ function GameScreen({
   const mapH = cellSize * MAP_ROWS;
   const hasAnomaly = anomalies.length > 0;
   const monsterVisible = monster.active && visibleTiles.has(`${monster.x},${monster.y}`);
-  const stepsLeft = Math.max(0, monsterDelay - stepCount);
-  const batteryPct = monster.active ? 0 : stepsLeft / monsterDelay;
+  const batteryPct = monster.active ? 0 : Math.min(spawnCountdown / MONSTER_SPAWN_SECS, 1);
+
+  // Other network players (not self)
+  const otherPlayers = multi ? netPlayers.filter(p => p.id !== multi.playerId) : [];
 
   return (
     <div style={{
       width: "100vw", height: "100vh",
       background: dead ? "#110000" : flashing ? "#110003" : "#040407",
       display: "flex", flexDirection: "column",
-      fontFamily: "'VT323', monospace",
-      overflow: "hidden", userSelect: "none",
+      fontFamily: "'VT323', monospace", overflow: "hidden", userSelect: "none",
       transition: "background 0.15s",
     }}>
-      {settings.crt && (
-        <div style={{
-          position: "fixed", inset: 0, pointerEvents: "none", zIndex: 100,
-          background: "radial-gradient(ellipse at 50% 50%, transparent 55%, rgba(0,0,0,0.82) 100%)",
-        }} />
-      )}
-      {settings.scanlines && (
-        <div style={{
-          position: "fixed", inset: 0, pointerEvents: "none", zIndex: 99,
-          backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.14) 2px,rgba(0,0,0,0.14) 4px)",
-        }} />
-      )}
+      {settings.crt && <div style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 100,
+        background: "radial-gradient(ellipse at 50% 50%, transparent 55%, rgba(0,0,0,0.82) 100%)" }} />}
+      {settings.scanlines && <div style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 99,
+        backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.14) 2px,rgba(0,0,0,0.14) 4px)" }} />}
 
       {/* HUD */}
-      <div style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "4px 16px", background: "#07070c",
-        borderBottom: "2px solid #12122a", flexShrink: 0, minHeight: 52,
-        gap: 8,
-      }}>
-        {/* Floor indicator */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "4px 14px", background: "#07070c", borderBottom: "2px solid #12122a", flexShrink: 0, minHeight: 52, gap: 6 }}>
+
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div>
-            <div style={{ fontSize: 9, color: "#446644", letterSpacing: 1 }}>ЭТАЖ</div>
-            <div style={{ fontSize: 30, color: "#fff", lineHeight: 1, textShadow: "0 0 12px #ff990088" }}>{floor}</div>
+            <div style={{ fontSize: 9, color: "#446644" }}>ЭТАЖ</div>
+            <div style={{ fontSize: 28, color: "#fff", lineHeight: 1, textShadow: "0 0 12px #ff990088" }}>{floor}</div>
           </div>
           <div style={{ display: "flex", flexDirection: "column-reverse", gap: 2 }}>
             {Array.from({ length: MAX_FLOOR }, (_, i) => i + 1).map(f => (
-              <div key={f} style={{
-                width: 9, height: 4,
+              <div key={f} style={{ width: 9, height: 4,
                 background: f > floor ? "#1a1a1a" : f === floor ? "#ff9900" : "#00aa55",
-                boxShadow: f === floor ? "0 0 8px #ff9900" : "none",
-                transition: "all 0.3s",
-              }} />
+                boxShadow: f === floor ? "0 0 8px #ff9900" : "none", transition: "all 0.3s" }} />
             ))}
           </div>
         </div>
 
-        {/* Status */}
         <div style={{ textAlign: "center" }}>
-          <div style={{
-            fontSize: 15, letterSpacing: 2,
+          <div style={{ fontSize: 14, letterSpacing: 2,
             color: dead ? "#ff0000" : !hasAnomaly ? "#00ff88" : foundAnomaly ? "#ff9900" : "#ff3366",
-            textShadow: "0 0 8px currentColor",
-          }}>
+            textShadow: "0 0 8px currentColor" }}>
             {dead ? "☠ МЁРТВ" : !hasAnomaly ? "✓ ЧИСТ" : foundAnomaly ? "◈ НАЙДЕНО" : "✦ АНОМАЛИЯ"}
           </div>
-          <div style={{ fontSize: 11, color: "#334433", marginTop: 1 }}>
+          <div style={{ fontSize: 10, color: "#334433", marginTop: 1 }}>
             {dead ? "R — рестарт" : !hasAnomaly ? "→ ВНИЗ [F]" : foundAnomaly ? "→ ЛИФТ [Q]" : "→ ОСМОТР [E]"}
           </div>
         </div>
 
-        {/* Battery / tokens / monster indicator */}
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             {monster.active && !dead && (
-              <div style={{ fontSize: 11, color: "#ff0000", textShadow: "0 0 8px #ff0000", animation: "anomaly-pulse 0.7s ease-in-out infinite" }}>
-                ◉ МОНСТР
-              </div>
+              <div style={{ fontSize: 11, color: "#ff0000", textShadow: "0 0 8px #ff0000", animation: "anomaly-pulse 0.7s ease-in-out infinite" }}>◉ МОНСТР</div>
             )}
-            {player.hiding && (
-              <div style={{ fontSize: 11, color: "#4488ff" }}>🫥 СКРЫТ</div>
-            )}
+            {player.hiding && <div style={{ fontSize: 11, color: "#4488ff" }}>🫥 СКРЫТ</div>}
+            {multi && <div style={{ fontSize: 10, color: multi.playerColor }}>{multi.playerName}</div>}
             <div style={{ fontSize: 11, color: "#664400" }}>🪙{tokens}</div>
           </div>
-          {/* Battery bar */}
+          {/* Countdown / battery bar */}
           {!monster.active && (
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               <span style={{ fontSize: 9, color: batteryPct < 0.3 ? "#ff3300" : "#446644" }}>🔦</span>
-              <div style={{ width: 52, height: 5, background: "#111", border: "1px solid #222" }}>
-                <div style={{
-                  width: `${batteryPct * 100}%`, height: "100%",
+              <div style={{ width: 50, height: 5, background: "#111", border: "1px solid #222" }}>
+                <div style={{ width: `${batteryPct * 100}%`, height: "100%",
                   background: batteryPct < 0.3 ? "#ff3300" : batteryPct < 0.6 ? "#ff9900" : "#00ff88",
-                  transition: "width 0.2s",
-                }} />
+                  transition: "width 1s linear" }} />
               </div>
+              <span style={{ fontSize: 9, color: batteryPct < 0.3 ? "#ff3300" : "#334433" }}>{spawnCountdown}с</span>
             </div>
+          )}
+          {/* Online players count */}
+          {multi && netPlayers.length > 0 && (
+            <div style={{ fontSize: 9, color: "#334455" }}>👥 {netPlayers.length} онлайн</div>
           )}
         </div>
 
-        <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={onShop} style={{
-            fontFamily: "'VT323', monospace", fontSize: 14,
+        <div style={{ display: "flex", gap: 5 }}>
+          <button onClick={onShop} style={{ fontFamily: "'VT323', monospace", fontSize: 14,
             background: "transparent", color: "#aa8800", border: "1px solid #443300",
-            padding: "3px 10px", cursor: "pointer",
-          }}>🪙[P]</button>
-          <button onClick={onMenu} style={{
-            fontFamily: "'VT323', monospace", fontSize: 14,
+            padding: "3px 8px", cursor: "pointer" }}>🪙[P]</button>
+          <button onClick={onMenu} style={{ fontFamily: "'VT323', monospace", fontSize: 14,
             background: "transparent", color: "#333", border: "1px solid #222",
-            padding: "3px 10px", cursor: "pointer",
-          }}>МЕНЮ</button>
+            padding: "3px 8px", cursor: "pointer" }}>МЕНЮ</button>
         </div>
       </div>
 
       {/* MAIN */}
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 8 }}>
-          <div style={{
-            width: mapW, height: mapH, position: "relative", flexShrink: 0,
-            boxShadow: "0 0 0 2px #12122a, 0 0 40px rgba(0,0,0,0.9)",
-          }}>
+          <div style={{ width: mapW, height: mapH, position: "relative", flexShrink: 0,
+            boxShadow: "0 0 0 2px #12122a, 0 0 40px rgba(0,0,0,0.9)", overflow: "hidden" }}>
+
             {/* Tiles */}
-            {BASE_MAP.map((row, ry) =>
-              row.map((tile, cx) => {
-                const isVisible = visibleTiles.has(`${cx},${ry}`);
-                const tc = getTileColor(tile, floor);
-                return (
-                  <div key={`${ry}-${cx}`} style={{
-                    position: "absolute",
-                    left: cx * cellSize, top: ry * cellSize,
-                    width: cellSize, height: cellSize,
-                    background: isVisible ? tc.bg : "#010102",
-                    borderRight: tc.border && isVisible ? `1px solid ${tc.border}` : undefined,
-                    borderBottom: tc.border && isVisible ? `1px solid ${tc.border}` : undefined,
-                    transition: "background 0.2s",
-                  }}>
-                    {tile === T_ELEVATOR && isVisible && (
-                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.52 }}>🛗</div>
-                    )}
-                    {tile === T_CABINET && isVisible && (
-                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.4, color: "#446" }}>▣</div>
-                    )}
-                    {tile === T_DOOR && isVisible && (
-                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.45, color: "#8B4513" }}>▬</div>
-                    )}
-                    {!isVisible && (
-                      <div style={{ position: "absolute", inset: 0, background: "#010102" }} />
-                    )}
-                  </div>
-                );
-              })
-            )}
+            {BASE_MAP.map((row, ry) => row.map((tile, cx) => {
+              const isVisible = visibleTiles.has(`${cx},${ry}`);
+              const tc = getTileColor(tile, floor);
+              return (
+                <div key={`${ry}-${cx}`} style={{
+                  position: "absolute", left: cx * cellSize, top: ry * cellSize,
+                  width: cellSize, height: cellSize,
+                  background: isVisible ? tc.bg : "#010102",
+                  borderRight: tc.border && isVisible ? `1px solid ${tc.border}` : undefined,
+                  borderBottom: tc.border && isVisible ? `1px solid ${tc.border}` : undefined,
+                }}>
+                  {tile === T_ELEVATOR && isVisible && (
+                    <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.52 }}>🛗</div>
+                  )}
+                  {tile === T_CABINET && isVisible && (
+                    <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.4, color: "#446" }}>▣</div>
+                  )}
+                  {tile === T_DOOR && isVisible && (
+                    <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.45, color: "#8B4513" }}>▬</div>
+                  )}
+                  {!isVisible && <div style={{ position: "absolute", inset: 0, background: "#010102" }} />}
+                </div>
+              );
+            }))}
 
             {/* Anomalies */}
             {anomalies.filter(a => a.visible && visibleTiles.has(`${a.x},${a.y}`)).map(a => {
               const ad = ANOMALY_DATA[a.type];
               return (
-                <div key={a.id} style={{
-                  position: "absolute",
-                  left: a.x * cellSize, top: a.y * cellSize,
-                  width: cellSize, height: cellSize,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  fontSize: cellSize * 0.7, color: ad.color,
-                  textShadow: `0 0 8px ${ad.color}, 0 0 20px ${ad.glow}`,
-                  zIndex: 5,
-                  animation: "anomaly-pulse 1.4s ease-in-out infinite",
-                  fontFamily: "monospace",
-                }}>
-                  {ad.symbol}
-                </div>
+                <AnimSprite key={a.id} x={a.x} y={a.y} cellSize={cellSize} zIndex={5}>
+                  <span style={{ fontSize: cellSize * 0.7, color: ad.color,
+                    textShadow: `0 0 8px ${ad.color}, 0 0 20px ${ad.glow}`,
+                    animation: "anomaly-pulse 1.4s ease-in-out infinite", fontFamily: "monospace" }}>
+                    {ad.symbol}
+                  </span>
+                </AnimSprite>
               );
             })}
 
+            {/* Other network players */}
+            {otherPlayers.map(np => (
+              <AnimSprite key={np.id} x={np.x} y={np.y} cellSize={cellSize} zIndex={9}>
+                {np.hiding
+                  ? <span style={{ fontSize: cellSize * 0.5, opacity: 0.4 }}>👤</span>
+                  : <svg width={cellSize * 0.75} height={cellSize * 0.88} viewBox="0 0 12 14" style={{ imageRendering: "pixelated" }}>
+                      <rect x="3" y="0" width="6" height="5" fill={np.color} />
+                      <rect x="4" y="2" width="1" height="1" fill="#222" />
+                      <rect x="7" y="2" width="1" height="1" fill="#222" />
+                      <rect x="2" y="5" width="8" height="6" fill={np.color + "99"} />
+                      <rect x="3" y="11" width="2" height="3" fill="#1a1a2a" />
+                      <rect x="7" y="11" width="2" height="3" fill="#1a1a2a" />
+                    </svg>
+                }
+                <span style={{ position: "absolute", top: -10, left: "50%", transform: "translateX(-50%)",
+                  fontSize: 6, color: np.color, whiteSpace: "nowrap", fontFamily: "'Press Start 2P',monospace" }}>
+                  {np.name.slice(0, 6)}
+                </span>
+              </AnimSprite>
+            ))}
+
             {/* Monster */}
             {monsterVisible && (
-              <div style={{
-                position: "absolute",
-                left: monster.x * cellSize, top: monster.y * cellSize,
-                width: cellSize, height: cellSize,
-                zIndex: 8, display: "flex", alignItems: "center", justifyContent: "center",
-              }}>
+              <AnimSprite x={monster.x} y={monster.y} cellSize={cellSize} zIndex={8}>
                 <svg width={cellSize * 0.8} height={cellSize * 0.9} viewBox="0 0 12 14" style={{ imageRendering: "pixelated" }}>
                   <rect x="2" y="1" width="8" height="6" fill="#660000" />
                   <rect x="1" y="2" width="10" height="4" fill="#880000" />
@@ -926,71 +952,49 @@ function GameScreen({
                   <rect x="3" y="3" width="1" height="1" fill="#ffffff" />
                   <rect x="7" y="3" width="1" height="1" fill="#ffffff" />
                   <rect x="4" y="5" width="4" height="1" fill="#ff3300" />
-                  <rect x="4" y="6" width="1" height="1" fill="#ff3300" />
-                  <rect x="7" y="6" width="1" height="1" fill="#ff3300" />
                   <rect x="2" y="7" width="8" height="5" fill="#550000" />
                   <rect x="1" y="8" width="2" height="3" fill="#440000" />
                   <rect x="9" y="8" width="2" height="3" fill="#440000" />
                   <rect x="3" y="12" width="2" height="2" fill="#330000" />
                   <rect x="7" y="12" width="2" height="2" fill="#330000" />
-                  <rect x="0" y="9" width="1" height="2" fill="#660000" />
-                  <rect x="11" y="9" width="1" height="2" fill="#660000" />
                 </svg>
-              </div>
+              </AnimSprite>
             )}
 
             {/* Player */}
-            {!player.hiding && (
-              <div style={{
-                position: "absolute",
-                left: player.x * cellSize, top: player.y * cellSize,
-                width: cellSize, height: cellSize,
-                zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center",
-              }}>
-                <svg width={cellSize * 0.75} height={cellSize * 0.88} viewBox="0 0 12 14" style={{ imageRendering: "pixelated" }}>
-                  <rect x="3" y="0" width="6" height="5" fill="#f5c842" />
-                  <rect x="4" y="2" width="1" height="1" fill="#222" />
-                  <rect x="7" y="2" width="1" height="1" fill="#222" />
-                  <rect x="4" y="4" width="4" height="1" fill="#c8a030" />
-                  <rect x="2" y="5" width="8" height="6" fill="#2244bb" />
-                  <rect x="1" y="6" width="2" height="4" fill="#1a3399" />
-                  <rect x="9" y="6" width="2" height="4" fill="#1a3399" />
-                  <rect x="3" y="11" width="2" height="3" fill="#1a1a2a" />
-                  <rect x="7" y="11" width="2" height="3" fill="#1a1a2a" />
-                </svg>
-              </div>
-            )}
-            {player.hiding && (
-              <div style={{
-                position: "absolute",
-                left: player.x * cellSize, top: player.y * cellSize,
-                width: cellSize, height: cellSize,
-                zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center",
-                fontSize: cellSize * 0.55, opacity: 0.4,
-              }}>👤</div>
-            )}
+            <AnimSprite x={player.x} y={player.y} cellSize={cellSize} zIndex={10}>
+              {player.hiding
+                ? <span style={{ fontSize: cellSize * 0.55, opacity: 0.4 }}>👤</span>
+                : <svg width={cellSize * 0.75} height={cellSize * 0.88} viewBox="0 0 12 14" style={{ imageRendering: "pixelated" }}>
+                    <rect x="3" y="0" width="6" height="5" fill="#f5c842" />
+                    <rect x="4" y="2" width="1" height="1" fill="#222" />
+                    <rect x="7" y="2" width="1" height="1" fill="#222" />
+                    <rect x="4" y="4" width="4" height="1" fill="#c8a030" />
+                    <rect x="2" y="5" width="8" height="6" fill="#2244bb" />
+                    <rect x="1" y="6" width="2" height="4" fill="#1a3399" />
+                    <rect x="9" y="6" width="2" height="4" fill="#1a3399" />
+                    <rect x="3" y="11" width="2" height="3" fill="#1a1a2a" />
+                    <rect x="7" y="11" width="2" height="3" fill="#1a1a2a" />
+                  </svg>
+              }
+            </AnimSprite>
 
-            {/* Win overlay */}
+            {/* Win / Dead overlays */}
             {win && (
-              <div style={{
-                position: "absolute", inset: 0, background: "rgba(0,20,10,0.92)",
+              <div style={{ position: "absolute", inset: 0, background: "rgba(0,20,10,0.92)",
                 display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-                zIndex: 50, fontFamily: "'Press Start 2P', monospace",
-              }}>
-                <div style={{ fontSize: 20, color: "#00ff88", textShadow: "0 0 30px #00ff88", marginBottom: 20 }}>ПОБЕДА!</div>
-                <div style={{ fontSize: 9, color: "#446644", marginBottom: 6 }}>ВСЕ ЭТАЖИ ПРОЙДЕНЫ</div>
-                <div style={{ fontSize: 7, color: "#aa8800", marginBottom: 30 }}>ТОКЕНОВ ЗАРАБОТАНО: {tokens}</div>
+                zIndex: 50, fontFamily: "'Press Start 2P', monospace" }}>
+                <div style={{ fontSize: 20, color: "#00ff88", textShadow: "0 0 30px #00ff88", marginBottom: 16 }}>ПОБЕДА!</div>
+                <div style={{ fontSize: 7, color: "#aa8800", marginBottom: 28 }}>ТОКЕНОВ: {tokens}</div>
                 <PixelBtn onClick={onRestart} color="#00ff88">▶ СНОВА</PixelBtn>
               </div>
             )}
             {dead && (
-              <div style={{
-                position: "absolute", inset: 0, background: "rgba(20,0,0,0.92)",
+              <div style={{ position: "absolute", inset: 0, background: "rgba(20,0,0,0.92)",
                 display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-                zIndex: 50, fontFamily: "'Press Start 2P', monospace",
-              }}>
-                <div style={{ fontSize: 20, color: "#ff0000", textShadow: "0 0 30px #ff0000", marginBottom: 20 }}>☠ КОНЕЦ</div>
-                <div style={{ fontSize: 9, color: "#663333", marginBottom: 30 }}>МОНСТР ПОЙМАЛ ВАС</div>
+                zIndex: 50, fontFamily: "'Press Start 2P', monospace" }}>
+                <div style={{ fontSize: 20, color: "#ff0000", textShadow: "0 0 30px #ff0000", marginBottom: 16 }}>☠ КОНЕЦ</div>
+                <div style={{ fontSize: 8, color: "#663333", marginBottom: 28 }}>МОНСТР ПОЙМАЛ ВАС</div>
                 <PixelBtn onClick={onRestart} color="#ff3366">▶ СНОВА [R]</PixelBtn>
               </div>
             )}
@@ -998,70 +1002,57 @@ function GameScreen({
         </div>
 
         {/* SIDE PANEL */}
-        <div style={{
-          width: 190, background: "#07070c", borderLeft: "2px solid #12122a",
-          display: "flex", flexDirection: "column", padding: 10, gap: 10, flexShrink: 0,
-        }}>
+        <div style={{ width: 190, background: "#07070c", borderLeft: "2px solid #12122a",
+          display: "flex", flexDirection: "column", padding: 10, gap: 9, flexShrink: 0 }}>
           <div style={{ fontSize: 11, color: "#225533", letterSpacing: 2 }}>ЛИФТ</div>
-          <button onClick={onLiftUp} style={{
-            fontFamily: "'VT323', monospace", fontSize: 18, padding: "8px 0", lineHeight: 1.5,
-            background: "#090c09", color: "#ff3366", border: "2px solid #ff3366",
-            cursor: "pointer", textShadow: "0 0 8px #ff336677",
-          }}>▲ ВВЕРХ [Q]<br/><span style={{ fontSize: 10, color: "#552233" }}>АНОМАЛИЯ</span></button>
+          <button onClick={onLiftUp} style={{ fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
+            background: "#090c09", color: "#ff3366", border: "2px solid #ff3366", cursor: "pointer" }}>
+            ▲ ВВЕРХ [Q]<br/><span style={{ fontSize: 10, color: "#552233" }}>АНОМАЛИЯ</span></button>
+          <button onClick={onLiftDown} style={{ fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
+            background: "#090c09", color: "#00ff88", border: "2px solid #00ff88", cursor: "pointer" }}>
+            ▼ ВНИЗ [F]<br/><span style={{ fontSize: 10, color: "#224433" }}>ЧИСТО</span></button>
 
-          <button onClick={onLiftDown} style={{
-            fontFamily: "'VT323', monospace", fontSize: 18, padding: "8px 0", lineHeight: 1.5,
-            background: "#090c09", color: "#00ff88", border: "2px solid #00ff88",
-            cursor: "pointer", textShadow: "0 0 8px #00ff8877",
-          }}>▼ ВНИЗ [F]<br/><span style={{ fontSize: 10, color: "#224433" }}>ЧИСТО</span></button>
+          <div style={{ fontSize: 11, color: "#225533", letterSpacing: 2, marginTop: 2 }}>ДЕЙСТВИЯ</div>
+          <button onClick={onInspect} style={{ fontFamily: "'VT323', monospace", fontSize: 16, padding: "6px 0", lineHeight: 1.5,
+            background: "#090910", color: "#4488ff", border: "2px solid #4488ff", cursor: "pointer" }}>◈ ОСМОТР [E]</button>
+          <button onClick={onHide} style={{ fontFamily: "'VT323', monospace", fontSize: 16, padding: "6px 0", lineHeight: 1.5,
+            background: "#090910", color: "#8844ff", border: "2px solid #8844ff", cursor: "pointer" }}>🫥 ШКАФ [H]</button>
+          <button onClick={onShop} style={{ fontFamily: "'VT323', monospace", fontSize: 16, padding: "6px 0", lineHeight: 1.5,
+            background: "#0a0800", color: "#aa8800", border: "2px solid #aa8800", cursor: "pointer" }}>🪙 МАГАЗИН [P]</button>
 
-          <div style={{ fontSize: 11, color: "#225533", letterSpacing: 2, marginTop: 4 }}>ДЕЙСТВИЯ</div>
-          <button onClick={onInspect} style={{
-            fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
-            background: "#090910", color: "#4488ff", border: "2px solid #4488ff",
-            cursor: "pointer",
-          }}>◈ ОСМОТР [E]</button>
+          {/* Online players list */}
+          {netPlayers.length > 0 && (
+            <div style={{ marginTop: 4, borderTop: "1px solid #111", paddingTop: 6 }}>
+              <div style={{ fontSize: 9, color: "#225533", marginBottom: 4 }}>В ИГРЕ</div>
+              {netPlayers.map(p => (
+                <div key={p.id} style={{ fontSize: 10, color: p.color, marginBottom: 2, display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ width: 6, height: 6, background: p.color, display: "inline-block", borderRadius: "50%", flexShrink: 0 }} />
+                  {p.name.slice(0, 8)}{p.dead ? " ☠" : ""}
+                </div>
+              ))}
+            </div>
+          )}
 
-          <button onClick={onHide} style={{
-            fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
-            background: "#090910", color: "#8844ff", border: "2px solid #8844ff",
-            cursor: "pointer",
-          }}>🫥 ШКАФ [H]</button>
-
-          <button onClick={onShop} style={{
-            fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
-            background: "#0a0800", color: "#aa8800", border: "2px solid #aa8800",
-            cursor: "pointer",
-          }}>🪙 МАГАЗИН [P]</button>
-
-          <div style={{ marginTop: "auto", fontSize: 10, color: "#1a2a1a", lineHeight: 2.2, borderTop: "1px solid #111", paddingTop: 8 }}>
+          <div style={{ marginTop: "auto", fontSize: 9, color: "#1a2a1a", lineHeight: 2.2, borderTop: "1px solid #111", paddingTop: 6 }}>
             WASD — движение<br/>E — осмотр<br/>H — шкаф<br/>Q — лифт↑<br/>F — лифт↓<br/>R — рестарт
           </div>
         </div>
       </div>
 
       {/* MESSAGE BAR */}
-      <div style={{
-        height: 40, background: "#05050a", borderTop: "2px solid #12122a",
-        display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
-      }}>
+      <div style={{ height: 40, background: "#05050a", borderTop: "2px solid #12122a",
+        display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
         {message && (
-          <div style={{
-            fontSize: 19,
+          <div style={{ fontSize: 19,
             color: message.includes("❌") || message.includes("☠") ? "#ff3366"
-              : message.includes("▶") || message.includes("✓") || message.includes("◈") ? "#ff9900"
-              : "#888",
-            textShadow: "0 0 6px currentColor",
-          }}>{message}</div>
+              : message.includes("▶") || message.includes("✓") || message.includes("◈") ? "#ff9900" : "#888",
+            textShadow: "0 0 6px currentColor" }}>{message}</div>
         )}
       </div>
 
       {/* MOBILE D-PAD */}
-      <div style={{
-        display: "flex", flexDirection: "column", alignItems: "center",
-        gap: 3, padding: "5px 0 7px", background: "#05050a",
-        borderTop: "1px solid #111", flexShrink: 0,
-      }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
+        gap: 3, padding: "5px 0 7px", background: "#05050a", borderTop: "1px solid #111", flexShrink: 0 }}>
         <MBtn onClick={() => onMove("up")}>▲</MBtn>
         <div style={{ display: "flex", gap: 3 }}>
           <MBtn onClick={() => onMove("left")}>◀</MBtn>
@@ -1091,10 +1082,9 @@ function GameScreen({
 
 function MBtn({ onClick, children, color = "#446644" }: { onClick: () => void; children: React.ReactNode; color?: string }) {
   return (
-    <button onClick={onClick} style={{
-      fontFamily: "'VT323', monospace", fontSize: 18, width: 36, height: 36,
-      background: "#0a0a10", color, border: `1px solid ${color}44`,
-      cursor: "pointer", lineHeight: 1, padding: 0,
-    }}>{children}</button>
+    <button onClick={onClick} style={{ fontFamily: "'VT323', monospace", fontSize: 18, width: 36, height: 36,
+      background: "#0a0a10", color, border: `1px solid ${color}44`, cursor: "pointer", lineHeight: 1, padding: 0 }}>
+      {children}
+    </button>
   );
 }

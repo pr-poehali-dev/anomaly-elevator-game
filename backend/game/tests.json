@@ -1,0 +1,12 @@
+{
+  "tests": [
+    {
+      "name": "Create room",
+      "method": "POST",
+      "path": "/?action=create",
+      "body": {"name": "АГЕНТ-1"},
+      "expectedStatus": 200,
+      "bodyMatcher": "partial"
+    }
+  ]
+}
