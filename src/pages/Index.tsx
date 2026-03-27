@@ -1,13 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
-type Screen = "menu" | "game" | "settings";
+type Screen = "menu" | "game" | "settings" | "shop";
 type Direction = "up" | "down" | "left" | "right";
 
 const MAP_COLS = 20;
 const MAP_ROWS = 15;
 const MAX_FLOOR = 8;
-const MONSTER_DELAY = 15000; // ms before monster appears
-const VISION_RADIUS = 4; // tiles player can see
+// Monster spawns after this many player steps
+const MONSTER_STEPS_DELAY = 20;
+// Base vision radius (upgradeable)
+const BASE_VISION = 3;
 
 const T_FLOOR = 0;
 const T_WALL = 1;
@@ -17,10 +19,8 @@ const T_DESK = 4;
 const T_CABINET = 5;
 const T_WINDOW = 6;
 
-// Tile solidity — can't walk on these
 const SOLID = new Set([T_WALL, T_DESK, T_CABINET, T_WINDOW]);
 
-// More walls, complex corridors
 const BASE_MAP: number[][] = [
   [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
   [1,0,0,0,0,1,0,0,0,1,1,0,0,0,1,0,0,0,0,1],
@@ -44,6 +44,16 @@ interface Player { x: number; y: number; hiding: boolean; }
 interface Monster { x: number; y: number; active: boolean; }
 interface Settings { sfx: boolean; crt: boolean; scanlines: boolean; }
 
+// Upgrades: vision radius levels and battery life (steps before monster comes, displayed as "battery")
+interface Upgrades {
+  visionLevel: number;   // 0=3, 1=4, 2=5, 3=6 tiles
+  batteryLevel: number;  // 0=20, 1=28, 2=38, 3=50 steps before monster
+}
+
+const VISION_LEVELS = [3, 4, 5, 6];
+const BATTERY_LEVELS = [20, 28, 38, 50];
+const UPGRADE_COSTS = { vision: [0, 3, 5, 9], battery: [0, 2, 4, 8] };
+
 function isWalkable(x: number, y: number): boolean {
   if (x < 0 || x >= MAP_COLS || y < 0 || y >= MAP_ROWS) return false;
   return !SOLID.has(BASE_MAP[y][x]);
@@ -58,6 +68,7 @@ function getWalkable(): { x: number; y: number }[] {
 }
 
 function generateAnomalies(): Anomaly[] {
+  // Always 1-2 anomalies per floor — never 0 so floor always requires action
   const count = Math.floor(Math.random() * 2) + 1;
   const walkable = getWalkable();
   const shuffled = [...walkable].sort(() => Math.random() - 0.5);
@@ -68,19 +79,16 @@ function generateAnomalies(): Anomaly[] {
   }));
 }
 
-// Simple BFS pathfinding for monster
 function bfsPath(from: { x: number; y: number }, to: { x: number; y: number }): { x: number; y: number } | null {
   const queue: { x: number; y: number; path: { x: number; y: number }[] }[] = [{ ...from, path: [] }];
   const visited = new Set<string>();
   visited.add(`${from.x},${from.y}`);
   while (queue.length > 0) {
     const cur = queue.shift()!;
-    const dirs = [{ x: 0, y: -1 }, { x: 0, y: 1 }, { x: -1, y: 0 }, { x: 1, y: 0 }];
-    for (const d of dirs) {
+    for (const d of [{ x: 0, y: -1 }, { x: 0, y: 1 }, { x: -1, y: 0 }, { x: 1, y: 0 }]) {
       const nx = cur.x + d.x, ny = cur.y + d.y;
       const key = `${nx},${ny}`;
-      if (visited.has(key)) continue;
-      if (!isWalkable(nx, ny)) continue;
+      if (visited.has(key) || !isWalkable(nx, ny)) continue;
       visited.add(key);
       const newPath = [...cur.path, { x: nx, y: ny }];
       if (nx === to.x && ny === to.y) return newPath[0] ?? null;
@@ -90,7 +98,6 @@ function bfsPath(from: { x: number; y: number }, to: { x: number; y: number }): 
   return null;
 }
 
-// Compute visible tiles using raycasting (simple line-of-sight)
 function computeVisible(player: Player, radius: number): Set<string> {
   const visible = new Set<string>();
   visible.add(`${player.x},${player.y}`);
@@ -109,7 +116,6 @@ function computeVisible(player: Player, radius: number): Set<string> {
   return visible;
 }
 
-// Anomaly appearances: more varied, no emoji — pixel-art symbols
 const ANOMALY_DATA = [
   { symbol: "✦", label: "СИГНАЛ",   color: "#ff3366", glow: "#ff003355" },
   { symbol: "◈", label: "ПОМЕХА",   color: "#ff6600", glow: "#ff440055" },
@@ -136,7 +142,8 @@ export default function Index() {
   const [player, setPlayer] = useState<Player>({ x: 9, y: 7, hiding: false });
   const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
   const [message, setMessage] = useState("");
-  const [floorAnomalyMap, setFloorAnomalyMap] = useState<Record<number, Anomaly[]>>({});
+  // floorVisited tracks which floors the player has ALREADY cleared (used from 8→1)
+  const [clearedFloors, setClearedFloors] = useState<Set<number>>(new Set());
   const [settings, setSettings] = useState<Settings>({ sfx: true, crt: true, scanlines: true });
   const [flashing, setFlashing] = useState(false);
   const [win, setWin] = useState(false);
@@ -144,21 +151,28 @@ export default function Index() {
   const [monster, setMonster] = useState<Monster>({ x: 0, y: 0, active: false });
   const [dead, setDead] = useState(false);
   const [visibleTiles, setVisibleTiles] = useState<Set<string>>(new Set());
+  // Steps counter for monster spawn
+  const [stepCount, setStepCount] = useState(0);
+  // Tokens = score currency earned per cleared floor
+  const [tokens, setTokens] = useState(0);
+  const [upgrades, setUpgrades] = useState<Upgrades>({ visionLevel: 0, batteryLevel: 0 });
 
   const msgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const monsterTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const monsterMoveTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioCtx = useRef<AudioContext | null>(null);
-  const stateRef = useRef({ floor, player, anomalies, foundAnomaly, floorAnomalyMap, monster, dead });
+  const stateRef = useRef({
+    floor, player, anomalies, foundAnomaly, monster, dead,
+    stepCount, clearedFloors, upgrades,
+  });
 
   useEffect(() => {
-    stateRef.current = { floor, player, anomalies, foundAnomaly, floorAnomalyMap, monster, dead };
-  }, [floor, player, anomalies, foundAnomaly, floorAnomalyMap, monster, dead]);
+    stateRef.current = { floor, player, anomalies, foundAnomaly, monster, dead, stepCount, clearedFloors, upgrades };
+  }, [floor, player, anomalies, foundAnomaly, monster, dead, stepCount, clearedFloors, upgrades]);
 
   // Recompute visibility when player moves
   useEffect(() => {
-    setVisibleTiles(computeVisible(player, VISION_RADIUS));
-  }, [player.x, player.y]);
+    const radius = VISION_LEVELS[upgrades.visionLevel] ?? BASE_VISION;
+    setVisibleTiles(computeVisible(player, radius));
+  }, [player.x, player.y, upgrades.visionLevel]);
 
   const getAudio = useCallback(() => {
     if (!audioCtx.current) {
@@ -181,11 +195,11 @@ export default function Index() {
     } catch (_e) { /* ignore */ }
   }, [settings.sfx, getAudio]);
 
-  const playStep = useCallback(() => playTone(100 + Math.random() * 20, 0.07, "square", 0.04), [playTone]);
-  const playLift = useCallback(() => { playTone(280, 0.12, "sawtooth", 0.1); setTimeout(() => playTone(220, 0.18, "sawtooth", 0.1), 130); }, [playTone]);
+  const playStep   = useCallback(() => playTone(100 + Math.random() * 20, 0.07, "square", 0.04), [playTone]);
+  const playLift   = useCallback(() => { playTone(280, 0.12, "sawtooth", 0.1); setTimeout(() => playTone(220, 0.18, "sawtooth", 0.1), 130); }, [playTone]);
   const playAnomaly = useCallback(() => { playTone(80, 0.3, "sawtooth", 0.18); setTimeout(() => playTone(55, 0.5, "sawtooth", 0.18), 220); }, [playTone]);
   const playSuccess = useCallback(() => { [440, 550, 660, 880].forEach((f, i) => setTimeout(() => playTone(f, 0.15, "square", 0.13), i * 90)); }, [playTone]);
-  const playScream = useCallback(() => { playTone(120, 0.8, "sawtooth", 0.3); setTimeout(() => playTone(80, 0.6, "sawtooth", 0.25), 400); }, [playTone]);
+  const playScream  = useCallback(() => { playTone(120, 0.8, "sawtooth", 0.3); setTimeout(() => playTone(80, 0.6, "sawtooth", 0.25), 400); }, [playTone]);
 
   const showMsg = useCallback((text: string, ms = 2500) => {
     setMessage(text);
@@ -193,131 +207,134 @@ export default function Index() {
     msgTimer.current = setTimeout(() => setMessage(""), ms);
   }, []);
 
-  const killMonsterTimers = useCallback(() => {
-    if (monsterTimer.current) { clearTimeout(monsterTimer.current); monsterTimer.current = null; }
-    if (monsterMoveTimer.current) { clearInterval(monsterMoveTimer.current); monsterMoveTimer.current = null; }
-  }, []);
+  // Monster moves one step (called after each player step)
+  const moveMonsterOneStep = useCallback(() => {
+    const { player: p, monster: m, dead: isDead, upgrades: upg } = stateRef.current;
+    if (isDead || !m.active) return;
+    if (p.hiding) return;
+    if (BASE_MAP[p.y][p.x] === T_ELEVATOR) return;
+
+    const doStep = (monsterPos: { x: number; y: number }) => {
+      const next = bfsPath(monsterPos, p);
+      if (!next) return monsterPos;
+      if (next.x === p.x && next.y === p.y) {
+        setDead(true);
+        playScream();
+        showMsg("☠ СХВАЧЕН! Нажми R для рестарта", 99999);
+      }
+      return next;
+    };
+
+    setMonster(prev => {
+      if (!prev.active) return prev;
+      const step1 = doStep({ x: prev.x, y: prev.y });
+      // 50% chance for a second step
+      if (Math.random() < 0.5) {
+        const step2 = doStep(step1);
+        return { ...prev, x: step2.x, y: step2.y };
+      }
+      return { ...prev, x: step1.x, y: step1.y };
+    });
+
+    // suppress unused warning
+    void upg;
+  }, [playScream, showMsg]);
 
   const spawnMonster = useCallback(() => {
     const walkable = getWalkable();
     const { player: curPlayer } = stateRef.current;
-    // Spawn far from player
     const far = walkable.filter(p => Math.abs(p.x - curPlayer.x) + Math.abs(p.y - curPlayer.y) > 8);
     const pos = far.length ? far[Math.floor(Math.random() * far.length)] : walkable[0];
     setMonster({ x: pos.x, y: pos.y, active: true });
     showMsg("⚠ ДАТЧИК ДВИЖЕНИЯ — В ЗДАНИИ ЧТО-ТО ЕСТЬ", 3000);
     playAnomaly();
+  }, [showMsg, playAnomaly]);
 
-    // Monster moves every 800ms
-    monsterMoveTimer.current = setInterval(() => {
-      const { player: p, monster: m, dead: isDead } = stateRef.current;
-      if (isDead || !m.active) return;
-      // If player hiding in cabinet — monster can't find
-      if (p.hiding) return;
-      // If player on elevator tile — monster can't attack
-      if (BASE_MAP[p.y][p.x] === T_ELEVATOR) return;
-
-      const next = bfsPath(m, p);
-      if (!next) return;
-      setMonster(prev => ({ ...prev, x: next.x, y: next.y }));
-      // Check catch
-      if (next.x === p.x && next.y === p.y) {
-        setDead(true);
-        playScream();
-        showMsg("☠ СХВАЧЕН! НАЖМИ R ДЛЯ РЕСТАРТА", 99999);
-      }
-    }, 800);
-  }, [showMsg, playAnomaly, playScream]);
-
-  const startMonsterTimer = useCallback(() => {
-    killMonsterTimers();
-    monsterTimer.current = setTimeout(() => spawnMonster(), MONSTER_DELAY);
-  }, [killMonsterTimers, spawnMonster]);
-
-  const goToFloor = useCallback((f: number, currentMap: Record<number, Anomaly[]>) => {
-    killMonsterTimers();
+  const goToFloor = useCallback((f: number) => {
     setMonster({ x: 0, y: 0, active: false });
-    const existing = currentMap[f];
-    const anoms = existing ?? generateAnomalies();
-    const newMap = existing ? currentMap : { ...currentMap, [f]: anoms };
+    setStepCount(0);
+    const anoms = generateAnomalies();
     setFloor(f);
-    setFloorAnomalyMap(newMap);
     setAnomalies(anoms);
     setPlayer({ x: 9, y: 7, hiding: false });
     setFoundAnomaly(false);
-    showMsg(anoms.length > 0 ? `▶ ЭТАЖ ${f} — ФИКСИРУЮ АКТИВНОСТЬ` : `▶ ЭТАЖ ${f} — ЧИСТО`, 2800);
-    startMonsterTimer();
-  }, [showMsg, killMonsterTimers, startMonsterTimer]);
+    showMsg(`▶ ЭТАЖ ${f} — ФИКСИРУЮ АКТИВНОСТЬ`, 2800);
+  }, [showMsg]);
 
   const resetToTop = useCallback(() => {
-    killMonsterTimers();
     setMonster({ x: 0, y: 0, active: false });
+    setStepCount(0);
     const anoms = generateAnomalies();
-    const newMap = { [MAX_FLOOR]: anoms };
     setFloor(MAX_FLOOR);
-    setFloorAnomalyMap(newMap);
+    setClearedFloors(new Set());
     setAnomalies(anoms);
     setPlayer({ x: 9, y: 7, hiding: false });
     setFoundAnomaly(false);
     showMsg(`СБРОС — ЭТАЖ ${MAX_FLOOR}`, 2800);
-    startMonsterTimer();
-  }, [showMsg, killMonsterTimers, startMonsterTimer]);
+  }, [showMsg]);
 
   const startGame = useCallback(() => {
-    killMonsterTimers();
     const anoms = generateAnomalies();
-    const newMap = { [MAX_FLOOR]: anoms };
-    setFloor(MAX_FLOOR); setFloorAnomalyMap(newMap); setAnomalies(anoms);
-    setPlayer({ x: 9, y: 7, hiding: false }); setWin(false); setFlashing(false);
+    setFloor(MAX_FLOOR);
+    setAnomalies(anoms);
+    setPlayer({ x: 9, y: 7, hiding: false });
+    setWin(false); setFlashing(false);
     setFoundAnomaly(false); setMessage(""); setDead(false);
     setMonster({ x: 0, y: 0, active: false });
+    setStepCount(0);
+    setClearedFloors(new Set());
     setScreen("game");
     showMsg(`▶ ЭТАЖ ${MAX_FLOOR} — НАЧИНАЕМ МИССИЮ`, 3000);
-    setTimeout(() => startMonsterTimer(), 100);
-  }, [showMsg, killMonsterTimers, startMonsterTimer]);
+  }, [showMsg]);
 
-  // ЛИФТ ВВЕРХ = есть аномалия, ЛИФТ ВНИЗ = чисто
+  // ЛИФТ: ВВЕРХ = зафиксировал аномалию → отчёт наверх (отчитываемся)
+  //        ВНИЗ  = переходим на следующий этаж вниз (миссия вниз с 8 до 1)
   const activateLift = useCallback((direction: "up" | "down") => {
-    const { floor: curFloor, player: curPlayer, anomalies: curAnomalies, foundAnomaly: curFound, floorAnomalyMap: curMap } = stateRef.current;
+    const { floor: curFloor, player: curPlayer, anomalies: curAnomalies, foundAnomaly: curFound, clearedFloors: cleared } = stateRef.current;
     const liftCol = 17, liftRow = 7;
     if (Math.abs(curPlayer.x - liftCol) > 2 || Math.abs(curPlayer.y - liftRow) > 2) {
       showMsg("Подойди к лифту (правая сторона)", 2000);
       return;
     }
-    const hasAnomaly = curAnomalies.length > 0;
 
     if (direction === "up") {
-      // ВВЕРХ — только если есть аномалия и она найдена
-      if (!hasAnomaly) {
-        showMsg("❌ ЭТАЖ ЧИСТ — нельзя ехать вверх! Жми ВНИЗ", 3000);
-        setFlashing(true); playAnomaly();
-        setTimeout(() => { setFlashing(false); resetToTop(); }, 1200);
-        return;
-      }
+      // ВВЕРХ = сообщить об аномалии — требует найденной аномалии
       if (!curFound) {
-        showMsg("Сначала найди аномалию — нажми [E]", 2500);
+        if (curAnomalies.length === 0) {
+          showMsg("❌ НА ЭТАЖЕ ЧИСТО — используй ВНИЗ [F]", 2500);
+        } else {
+          showMsg("Сначала найди аномалию — нажми [E] рядом с ней", 2500);
+        }
         return;
       }
-      // Went up from floor 8 — report and finish
-      if (curFloor >= MAX_FLOOR) {
-        playSuccess(); setWin(true); return;
-      }
+      // Зафиксировали — зарабатываем токен, идём ВНИЗ (следующий этаж)
+      const newCleared = new Set(cleared).add(curFloor);
+      setClearedFloors(newCleared);
+      setTokens(t => t + 1);
       playLift();
-      showMsg("✓ АНОМАЛИЯ ОТМЕЧЕНА — ЕДЕМ ВВЕРХ", 2000);
-      goToFloor(curFloor + 1, curMap);
-    } else {
-      // ВНИЗ — только если нет аномалии или она найдена и чисто
-      if (hasAnomaly && !curFound) {
-        showMsg("❌ АНОМАЛИЯ НЕ ЗАФИКСИРОВАНА! Сброс...", 3000);
-        setFlashing(true); playAnomaly();
-        setTimeout(() => { setFlashing(false); resetToTop(); }, 1200);
-        return;
-      }
       if (curFloor <= 1) {
         playSuccess(); setWin(true); return;
       }
+      showMsg(`✓ АНОМАЛИЯ ЗАФИКСИРОВАНА +1 ТОКЕН — ЭТАЖ ${curFloor - 1}`, 2200);
+      goToFloor(curFloor - 1);
+
+    } else {
+      // ВНИЗ = спуститься без фиксации (только если этаж чист)
+      if (curAnomalies.length > 0 && !curFound) {
+        showMsg("❌ АНОМАЛИЯ НЕ ЗАФИКСИРОВАНА! Используй [Q] после осмотра", 3000);
+        setFlashing(true); playAnomaly();
+        setTimeout(() => { setFlashing(false); resetToTop(); }, 1200);
+        return;
+      }
+      // Этаж чист (аномалий нет) — просто едем вниз
+      const newCleared = new Set(cleared).add(curFloor);
+      setClearedFloors(newCleared);
       playLift();
-      goToFloor(curFloor - 1, curMap);
+      if (curFloor <= 1) {
+        playSuccess(); setWin(true); return;
+      }
+      showMsg(`▶ ЭТАЖ ЧИСТ — ЕДЕМ НА ${curFloor - 1}`, 2000);
+      goToFloor(curFloor - 1);
     }
   }, [showMsg, playAnomaly, playLift, playSuccess, goToFloor, resetToTop]);
 
@@ -330,7 +347,7 @@ export default function Index() {
       setFoundAnomaly(true);
       playAnomaly();
       setFlashing(true);
-      showMsg(`▶ АНОМАЛИЯ: ${ANOMALY_DATA[nearby.type].label} — Жми ВВЕРХ [Q]`, 4000);
+      showMsg(`▶ АНОМАЛИЯ: ${ANOMALY_DATA[nearby.type].label} — Жми [Q] у лифта`, 4000);
       setTimeout(() => setFlashing(false), 500);
       setAnomalies(prev => prev.map(a => a.id === nearby.id ? { ...a, visible: true } : a));
     } else {
@@ -340,9 +357,10 @@ export default function Index() {
   }, [playAnomaly, playTone, showMsg]);
 
   const movePlayer = useCallback((dir: Direction) => {
-    const { dead: isDead, player: curPlayer } = stateRef.current;
+    const { dead: isDead } = stateRef.current;
     if (isDead) return;
-    // Unhide when moving
+
+    let moved = false;
     setPlayer(prev => {
       let nx = prev.x, ny = prev.y;
       if (dir === "left") nx--;
@@ -350,21 +368,40 @@ export default function Index() {
       if (dir === "up") ny--;
       if (dir === "down") ny++;
       if (!isWalkable(nx, ny)) return prev;
+      moved = true;
       playStep();
       return { x: nx, y: ny, hiding: false };
     });
-    // Check monster catch after move
+
+    // After a valid move: increment step counter, spawn or move monster
     setTimeout(() => {
-      const { player: p, monster: m, dead: isDead2 } = stateRef.current;
-      if (isDead2 || !m.active) return;
-      if (p.hiding || BASE_MAP[p.y][p.x] === T_ELEVATOR) return;
-      if (m.x === p.x && m.y === p.y) {
-        setDead(true);
-        playScream();
-        showMsg("☠ СХВАЧЕН! Нажми R для рестарта", 99999);
+      if (!moved) return;
+      const { monster: m, dead: isDead2, upgrades: upg } = stateRef.current;
+      const monsterDelay = BATTERY_LEVELS[upg.batteryLevel] ?? MONSTER_STEPS_DELAY;
+
+      setStepCount(prev => {
+        const next = prev + 1;
+        if (!m.active && next >= monsterDelay) {
+          spawnMonster();
+        }
+        return next;
+      });
+
+      if (m.active && !isDead2) {
+        moveMonsterOneStep();
       }
-    }, 50);
-  }, [playStep, playScream, showMsg]);
+
+      // Check collision after player moved
+      const { player: p, monster: m2, dead: isDead3 } = stateRef.current;
+      if (!isDead3 && m2.active && !p.hiding && BASE_MAP[p.y][p.x] !== T_ELEVATOR) {
+        if (m2.x === p.x && m2.y === p.y) {
+          setDead(true);
+          playScream();
+          showMsg("☠ СХВАЧЕН! Нажми R для рестарта", 99999);
+        }
+      }
+    }, 30);
+  }, [playStep, playScream, showMsg, spawnMonster, moveMonsterOneStep]);
 
   const hideInCabinet = useCallback(() => {
     const { player: curPlayer, dead: isDead } = stateRef.current;
@@ -378,7 +415,7 @@ export default function Index() {
 
     if (nearCabinet) {
       setPlayer(prev => ({ ...prev, hiding: !prev.hiding }));
-      showMsg(stateRef.current.player.hiding ? "Вышел из укрытия" : "🫥 Спрятался в шкафу — монстр не найдёт", 2500);
+      showMsg(stateRef.current.player.hiding ? "Вышел из укрытия" : "🫥 В шкафу — монстр не найдёт", 2500);
     } else {
       showMsg("Нет шкафа рядом", 1200);
     }
@@ -390,8 +427,8 @@ export default function Index() {
       if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
       const { dead: isDead } = stateRef.current;
       if (e.key === "r" || e.key === "R") { startGame(); return; }
-      if (isDead) return;
-      if (win) return;
+      if (e.key === "p" || e.key === "P") { setScreen("shop"); return; }
+      if (isDead || win) return;
       if (e.key === "ArrowLeft"  || e.key === "a" || e.key === "A") movePlayer("left");
       if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") movePlayer("right");
       if (e.key === "ArrowUp"    || e.key === "w" || e.key === "W") movePlayer("up");
@@ -405,23 +442,169 @@ export default function Index() {
     return () => window.removeEventListener("keydown", handler);
   }, [screen, movePlayer, inspect, activateLift, win, startGame, hideInCabinet]);
 
-  useEffect(() => () => killMonsterTimers(), [killMonsterTimers]);
-
   if (screen === "menu") return <MenuScreen onStart={startGame} onSettings={() => setScreen("settings")} />;
   if (screen === "settings") return <SettingsScreen settings={settings} setSettings={setSettings} onBack={() => setScreen("menu")} />;
+  if (screen === "shop") return (
+    <ShopScreen
+      tokens={tokens} upgrades={upgrades}
+      onBuy={(type) => {
+        const { upgrades: upg } = stateRef.current;
+        if (type === "vision") {
+          const nextLv = upg.visionLevel + 1;
+          if (nextLv >= VISION_LEVELS.length) return;
+          const cost = UPGRADE_COSTS.vision[nextLv];
+          if (tokens < cost) { return; }
+          setTokens(t => t - cost);
+          setUpgrades(u => ({ ...u, visionLevel: nextLv }));
+        } else {
+          const nextLv = upg.batteryLevel + 1;
+          if (nextLv >= BATTERY_LEVELS.length) return;
+          const cost = UPGRADE_COSTS.battery[nextLv];
+          if (tokens < cost) { return; }
+          setTokens(t => t - cost);
+          setUpgrades(u => ({ ...u, batteryLevel: nextLv }));
+        }
+      }}
+      onBack={() => setScreen("game")}
+    />
+  );
+
+  const monsterDelay = BATTERY_LEVELS[upgrades.batteryLevel] ?? MONSTER_STEPS_DELAY;
 
   return (
     <GameScreen
       floor={floor} player={player} anomalies={anomalies} message={message}
       flashing={flashing} win={win} settings={settings} foundAnomaly={foundAnomaly}
       monster={monster} dead={dead} visibleTiles={visibleTiles}
+      stepCount={stepCount} monsterDelay={monsterDelay}
+      tokens={tokens} upgrades={upgrades}
       onMove={movePlayer} onInspect={inspect}
       onLiftUp={() => activateLift("up")} onLiftDown={() => activateLift("down")}
       onHide={hideInCabinet}
       onMenu={() => setScreen("menu")} onRestart={startGame}
+      onShop={() => setScreen("shop")}
     />
   );
 }
+
+// ─── SHOP ────────────────────────────────────────────────────────────────────
+
+function ShopScreen({ tokens, upgrades, onBuy, onBack }: {
+  tokens: number;
+  upgrades: Upgrades;
+  onBuy: (type: "vision" | "battery") => void;
+  onBack: () => void;
+}) {
+  const visionNextLv = upgrades.visionLevel + 1;
+  const batteryNextLv = upgrades.batteryLevel + 1;
+  const visionMaxed = visionNextLv >= VISION_LEVELS.length;
+  const batteryMaxed = batteryNextLv >= BATTERY_LEVELS.length;
+  const visionCost = visionMaxed ? 0 : UPGRADE_COSTS.vision[visionNextLv];
+  const batteryCost = batteryMaxed ? 0 : UPGRADE_COSTS.battery[batteryNextLv];
+
+  return (
+    <div style={{
+      width: "100vw", height: "100vh", background: "#000",
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+      fontFamily: "'Press Start 2P', monospace", color: "#00ff88",
+      position: "relative", overflow: "hidden",
+    }}>
+      <div style={{
+        position: "absolute", inset: 0, pointerEvents: "none",
+        backgroundImage: "repeating-linear-gradient(0deg,transparent,transparent 31px,rgba(0,255,136,0.025) 31px,rgba(0,255,136,0.025) 32px)",
+      }} />
+
+      <div style={{ fontSize: 7, color: "#226622", marginBottom: 8, letterSpacing: 4 }}>▓▓▓ МАГАЗИН ▓▓▓</div>
+      <div style={{ fontSize: 9, color: "#ff9900", marginBottom: 32, letterSpacing: 2 }}>
+        ТОКЕНЫ: <span style={{ color: "#fff", textShadow: "0 0 8px #ff990066" }}>{tokens}</span>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 20, width: 340 }}>
+        {/* Фонарик */}
+        <ShopItem
+          icon="🔦"
+          title="ФОНАРИК"
+          desc={visionMaxed
+            ? "МАКСИМАЛЬНЫЙ УРОВЕНЬ"
+            : `Радиус: ${VISION_LEVELS[upgrades.visionLevel]} → ${VISION_LEVELS[visionNextLv]} клеток`}
+          level={upgrades.visionLevel}
+          maxLevel={VISION_LEVELS.length - 1}
+          cost={visionCost}
+          tokens={tokens}
+          maxed={visionMaxed}
+          onBuy={() => onBuy("vision")}
+        />
+        {/* Батарейка */}
+        <ShopItem
+          icon="🔋"
+          title="БАТАРЕЙКА"
+          desc={batteryMaxed
+            ? "МАКСИМАЛЬНЫЙ УРОВЕНЬ"
+            : `Шагов до монстра: ${BATTERY_LEVELS[upgrades.batteryLevel]} → ${BATTERY_LEVELS[batteryNextLv]}`}
+          level={upgrades.batteryLevel}
+          maxLevel={BATTERY_LEVELS.length - 1}
+          cost={batteryCost}
+          tokens={tokens}
+          maxed={batteryMaxed}
+          onBuy={() => onBuy("battery")}
+        />
+      </div>
+
+      <div style={{ marginTop: 36 }}>
+        <PixelBtn onClick={onBack} color="#ff9900">← ВЕРНУТЬСЯ</PixelBtn>
+      </div>
+      <div style={{ position: "absolute", bottom: 16, fontSize: 6, color: "#1a3322" }}>
+        ТОКЕНЫ ЗАРАБАТЫВАЮТСЯ ЗА КАЖДЫЙ ПРОЙДЁННЫЙ ЭТАЖ
+      </div>
+    </div>
+  );
+}
+
+function ShopItem({ icon, title, desc, level, maxLevel, cost, tokens, maxed, onBuy }: {
+  icon: string; title: string; desc: string;
+  level: number; maxLevel: number; cost: number; tokens: number;
+  maxed: boolean; onBuy: () => void;
+}) {
+  const canAfford = tokens >= cost && !maxed;
+  return (
+    <div style={{
+      border: `2px solid ${maxed ? "#226622" : "#334433"}`,
+      padding: "14px 18px",
+      display: "flex", flexDirection: "column", gap: 8,
+      background: "#050a05",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ fontSize: 11, color: "#aaa" }}>{icon} {title}</span>
+        <div style={{ display: "flex", gap: 3 }}>
+          {Array.from({ length: maxLevel }).map((_, i) => (
+            <div key={i} style={{
+              width: 10, height: 6,
+              background: i < level ? "#00ff88" : "#111",
+              border: "1px solid #224422",
+            }} />
+          ))}
+        </div>
+      </div>
+      <div style={{ fontSize: 7, color: "#446644" }}>{desc}</div>
+      <button
+        onClick={onBuy}
+        disabled={!canAfford}
+        style={{
+          fontFamily: "'Press Start 2P', monospace",
+          fontSize: 8, padding: "8px 0",
+          background: maxed ? "#0a180a" : canAfford ? "#00ff88" : "#0f1a0f",
+          color: maxed ? "#226622" : canAfford ? "#000" : "#224422",
+          border: `2px solid ${maxed ? "#1a3a1a" : canAfford ? "#00ff88" : "#1a3a1a"}`,
+          cursor: canAfford ? "pointer" : "default",
+        }}
+      >
+        {maxed ? "УЛУЧШЕНО" : `КУПИТЬ — ${cost} ТОКЕН${cost === 1 ? "" : "А"}`}
+      </button>
+    </div>
+  );
+}
+
+// ─── MENU ────────────────────────────────────────────────────────────────────
 
 function MenuScreen({ onStart, onSettings }: { onStart: () => void; onSettings: () => void }) {
   const [blink, setBlink] = useState(true);
@@ -463,8 +646,8 @@ function MenuScreen({ onStart, onSettings }: { onStart: () => void; onSettings: 
       <div style={{ fontSize: 6, color: "#335533", textAlign: "center", lineHeight: 2.8, minHeight: 60 }}>
         {blink ? "[ WASD / СТРЕЛКИ — ДВИЖЕНИЕ ]" : <span style={{ opacity: 0 }}>X</span>}<br/>
         [ E — ОСМОТР ]  [ H — ШКАФ ]<br/>
-        [ Q — ЛИФТ ВВЕРХ (аномалия) ]<br/>
-        [ F — ЛИФТ ВНИЗ (чисто) ]
+        [ Q — ЛИФТ (аномалия найдена) ]<br/>
+        [ F — ЛИФТ (этаж чист) ]  [ P — МАГАЗИН ]
       </div>
 
       <div style={{ position: "absolute", bottom: 18, fontSize: 6, color: "#1a3322", textAlign: "center" }}>
@@ -473,6 +656,8 @@ function MenuScreen({ onStart, onSettings }: { onStart: () => void; onSettings: 
     </div>
   );
 }
+
+// ─── SETTINGS ────────────────────────────────────────────────────────────────
 
 function SettingsScreen({ settings, setSettings, onBack }: {
   settings: Settings;
@@ -505,6 +690,8 @@ function SettingsScreen({ settings, setSettings, onBack }: {
   );
 }
 
+// ─── PIXEL BTN ───────────────────────────────────────────────────────────────
+
 function PixelBtn({ onClick, children, color }: { onClick: () => void; children: React.ReactNode; color: string }) {
   const [hover, setHover] = useState(false);
   return (
@@ -522,17 +709,20 @@ function PixelBtn({ onClick, children, color }: { onClick: () => void; children:
   );
 }
 
+// ─── GAME SCREEN ─────────────────────────────────────────────────────────────
+
 function GameScreen({
   floor, player, anomalies, message, flashing, win, settings, foundAnomaly,
-  monster, dead, visibleTiles,
-  onMove, onInspect, onLiftUp, onLiftDown, onHide, onMenu, onRestart,
+  monster, dead, visibleTiles, stepCount, monsterDelay, tokens, upgrades,
+  onMove, onInspect, onLiftUp, onLiftDown, onHide, onMenu, onRestart, onShop,
 }: {
   floor: number; player: Player; anomalies: Anomaly[]; message: string;
   flashing: boolean; win: boolean; settings: Settings; foundAnomaly: boolean;
   monster: Monster; dead: boolean; visibleTiles: Set<string>;
+  stepCount: number; monsterDelay: number; tokens: number; upgrades: Upgrades;
   onMove: (d: Direction) => void; onInspect: () => void;
   onLiftUp: () => void; onLiftDown: () => void; onHide: () => void;
-  onMenu: () => void; onRestart: () => void;
+  onMenu: () => void; onRestart: () => void; onShop: () => void;
 }) {
   const [cellSize, setCellSize] = useState(32);
 
@@ -555,6 +745,8 @@ function GameScreen({
   const mapH = cellSize * MAP_ROWS;
   const hasAnomaly = anomalies.length > 0;
   const monsterVisible = monster.active && visibleTiles.has(`${monster.x},${monster.y}`);
+  const stepsLeft = Math.max(0, monsterDelay - stepCount);
+  const batteryPct = monster.active ? 0 : stepsLeft / monsterDelay;
 
   return (
     <div style={{
@@ -581,18 +773,20 @@ function GameScreen({
       {/* HUD */}
       <div style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "6px 16px", background: "#07070c",
-        borderBottom: "2px solid #12122a", flexShrink: 0, minHeight: 56,
+        padding: "4px 16px", background: "#07070c",
+        borderBottom: "2px solid #12122a", flexShrink: 0, minHeight: 52,
+        gap: 8,
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        {/* Floor indicator */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div>
-            <div style={{ fontSize: 10, color: "#446644", letterSpacing: 1 }}>ЭТАЖ</div>
-            <div style={{ fontSize: 34, color: "#fff", lineHeight: 1, textShadow: "0 0 12px #ff990088" }}>{floor}</div>
+            <div style={{ fontSize: 9, color: "#446644", letterSpacing: 1 }}>ЭТАЖ</div>
+            <div style={{ fontSize: 30, color: "#fff", lineHeight: 1, textShadow: "0 0 12px #ff990088" }}>{floor}</div>
           </div>
           <div style={{ display: "flex", flexDirection: "column-reverse", gap: 2 }}>
             {Array.from({ length: MAX_FLOOR }, (_, i) => i + 1).map(f => (
               <div key={f} style={{
-                width: 10, height: 4,
+                width: 9, height: 4,
                 background: f > floor ? "#1a1a1a" : f === floor ? "#ff9900" : "#00aa55",
                 boxShadow: f === floor ? "0 0 8px #ff9900" : "none",
                 transition: "all 0.3s",
@@ -601,31 +795,56 @@ function GameScreen({
           </div>
         </div>
 
+        {/* Status */}
         <div style={{ textAlign: "center" }}>
           <div style={{
-            fontSize: 16, letterSpacing: 2,
+            fontSize: 15, letterSpacing: 2,
             color: dead ? "#ff0000" : !hasAnomaly ? "#00ff88" : foundAnomaly ? "#ff9900" : "#ff3366",
             textShadow: "0 0 8px currentColor",
           }}>
-            {dead ? "☠ МЁ Р Т В" : !hasAnomaly ? "✓ ЭТАЖ ЧИСТ" : foundAnomaly ? "◈ НАЙДЕНО" : "✦ АНОМАЛИЯ"}
+            {dead ? "☠ МЁРТВ" : !hasAnomaly ? "✓ ЧИСТ" : foundAnomaly ? "◈ НАЙДЕНО" : "✦ АНОМАЛИЯ"}
           </div>
-          <div style={{ fontSize: 12, color: "#334433", marginTop: 2 }}>
-            {dead ? "R — рестарт" : !hasAnomaly ? "→ ВНИЗ [F]" : foundAnomaly ? "→ ВВЕРХ [Q]" : "→ ОСМОТР [E]"}
+          <div style={{ fontSize: 11, color: "#334433", marginTop: 1 }}>
+            {dead ? "R — рестарт" : !hasAnomaly ? "→ ВНИЗ [F]" : foundAnomaly ? "→ ЛИФТ [Q]" : "→ ОСМОТР [E]"}
           </div>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {monster.active && !dead && (
-            <div style={{ fontSize: 12, color: "#ff0000", textShadow: "0 0 8px #ff0000", animation: "anomaly-pulse 0.8s ease-in-out infinite" }}>
-              ◉ МОНСТР
+        {/* Battery / tokens / monster indicator */}
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {monster.active && !dead && (
+              <div style={{ fontSize: 11, color: "#ff0000", textShadow: "0 0 8px #ff0000", animation: "anomaly-pulse 0.7s ease-in-out infinite" }}>
+                ◉ МОНСТР
+              </div>
+            )}
+            {player.hiding && (
+              <div style={{ fontSize: 11, color: "#4488ff" }}>🫥 СКРЫТ</div>
+            )}
+            <div style={{ fontSize: 11, color: "#664400" }}>🪙{tokens}</div>
+          </div>
+          {/* Battery bar */}
+          {!monster.active && (
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ fontSize: 9, color: batteryPct < 0.3 ? "#ff3300" : "#446644" }}>🔦</span>
+              <div style={{ width: 52, height: 5, background: "#111", border: "1px solid #222" }}>
+                <div style={{
+                  width: `${batteryPct * 100}%`, height: "100%",
+                  background: batteryPct < 0.3 ? "#ff3300" : batteryPct < 0.6 ? "#ff9900" : "#00ff88",
+                  transition: "width 0.2s",
+                }} />
+              </div>
             </div>
           )}
-          {player.hiding && (
-            <div style={{ fontSize: 12, color: "#4488ff", textShadow: "0 0 6px #4488ff" }}>🫥 СКРЫТ</div>
-          )}
-          <div style={{ fontSize: 12, color: "#223322", textAlign: "right" }}>ЦЕЛЬ:<br/>ЭТАЖ 1</div>
+        </div>
+
+        <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={onShop} style={{
+            fontFamily: "'VT323', monospace", fontSize: 14,
+            background: "transparent", color: "#aa8800", border: "1px solid #443300",
+            padding: "3px 10px", cursor: "pointer",
+          }}>🪙[P]</button>
           <button onClick={onMenu} style={{
-            fontFamily: "'VT323', monospace", fontSize: 15,
+            fontFamily: "'VT323', monospace", fontSize: 14,
             background: "transparent", color: "#333", border: "1px solid #222",
             padding: "3px 10px", cursor: "pointer",
           }}>МЕНЮ</button>
@@ -644,7 +863,6 @@ function GameScreen({
               row.map((tile, cx) => {
                 const isVisible = visibleTiles.has(`${cx},${ry}`);
                 const tc = getTileColor(tile, floor);
-                const isElevator = tile === T_ELEVATOR;
                 return (
                   <div key={`${ry}-${cx}`} style={{
                     position: "absolute",
@@ -655,7 +873,7 @@ function GameScreen({
                     borderBottom: tc.border && isVisible ? `1px solid ${tc.border}` : undefined,
                     transition: "background 0.2s",
                   }}>
-                    {isElevator && isVisible && (
+                    {tile === T_ELEVATOR && isVisible && (
                       <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.52 }}>🛗</div>
                     )}
                     {tile === T_CABINET && isVisible && (
@@ -664,7 +882,6 @@ function GameScreen({
                     {tile === T_DOOR && isVisible && (
                       <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: cellSize * 0.45, color: "#8B4513" }}>▬</div>
                     )}
-                    {/* Fog overlay for partially visible */}
                     {!isVisible && (
                       <div style={{ position: "absolute", inset: 0, background: "#010102" }} />
                     )}
@@ -673,7 +890,7 @@ function GameScreen({
               })
             )}
 
-            {/* Anomalies — only if visible */}
+            {/* Anomalies */}
             {anomalies.filter(a => a.visible && visibleTiles.has(`${a.x},${a.y}`)).map(a => {
               const ad = ANOMALY_DATA[a.type];
               return (
@@ -702,26 +919,20 @@ function GameScreen({
                 zIndex: 8, display: "flex", alignItems: "center", justifyContent: "center",
               }}>
                 <svg width={cellSize * 0.8} height={cellSize * 0.9} viewBox="0 0 12 14" style={{ imageRendering: "pixelated" }}>
-                  {/* Monster body — dark red creature */}
                   <rect x="2" y="1" width="8" height="6" fill="#660000" />
                   <rect x="1" y="2" width="10" height="4" fill="#880000" />
-                  {/* Eyes — glowing white */}
                   <rect x="3" y="3" width="2" height="2" fill="#ff0000" />
                   <rect x="7" y="3" width="2" height="2" fill="#ff0000" />
                   <rect x="3" y="3" width="1" height="1" fill="#ffffff" />
                   <rect x="7" y="3" width="1" height="1" fill="#ffffff" />
-                  {/* Mouth */}
                   <rect x="4" y="5" width="4" height="1" fill="#ff3300" />
                   <rect x="4" y="6" width="1" height="1" fill="#ff3300" />
                   <rect x="7" y="6" width="1" height="1" fill="#ff3300" />
-                  {/* Body */}
                   <rect x="2" y="7" width="8" height="5" fill="#550000" />
                   <rect x="1" y="8" width="2" height="3" fill="#440000" />
                   <rect x="9" y="8" width="2" height="3" fill="#440000" />
-                  {/* Legs */}
                   <rect x="3" y="12" width="2" height="2" fill="#330000" />
                   <rect x="7" y="12" width="2" height="2" fill="#330000" />
-                  {/* Claws */}
                   <rect x="0" y="9" width="1" height="2" fill="#660000" />
                   <rect x="11" y="9" width="1" height="2" fill="#660000" />
                 </svg>
@@ -749,14 +960,13 @@ function GameScreen({
                 </svg>
               </div>
             )}
-            {/* Hiding indicator */}
             {player.hiding && (
               <div style={{
                 position: "absolute",
                 left: player.x * cellSize, top: player.y * cellSize,
                 width: cellSize, height: cellSize,
                 zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center",
-                fontSize: cellSize * 0.55, opacity: 0.5,
+                fontSize: cellSize * 0.55, opacity: 0.4,
               }}>👤</div>
             )}
 
@@ -768,7 +978,8 @@ function GameScreen({
                 zIndex: 50, fontFamily: "'Press Start 2P', monospace",
               }}>
                 <div style={{ fontSize: 20, color: "#00ff88", textShadow: "0 0 30px #00ff88", marginBottom: 20 }}>ПОБЕДА!</div>
-                <div style={{ fontSize: 9, color: "#446644", marginBottom: 30 }}>ВСЕ ЭТАЖИ ПРОЙДЕНЫ</div>
+                <div style={{ fontSize: 9, color: "#446644", marginBottom: 6 }}>ВСЕ ЭТАЖИ ПРОЙДЕНЫ</div>
+                <div style={{ fontSize: 7, color: "#aa8800", marginBottom: 30 }}>ТОКЕНОВ ЗАРАБОТАНО: {tokens}</div>
                 <PixelBtn onClick={onRestart} color="#00ff88">▶ СНОВА</PixelBtn>
               </div>
             )}
@@ -791,47 +1002,55 @@ function GameScreen({
           width: 190, background: "#07070c", borderLeft: "2px solid #12122a",
           display: "flex", flexDirection: "column", padding: 10, gap: 10, flexShrink: 0,
         }}>
-          <div style={{ fontSize: 12, color: "#225533", letterSpacing: 2 }}>ЛИФТ</div>
+          <div style={{ fontSize: 11, color: "#225533", letterSpacing: 2 }}>ЛИФТ</div>
           <button onClick={onLiftUp} style={{
-            fontFamily: "'VT323', monospace", fontSize: 20, padding: "10px 0", lineHeight: 1.5,
+            fontFamily: "'VT323', monospace", fontSize: 18, padding: "8px 0", lineHeight: 1.5,
             background: "#090c09", color: "#ff3366", border: "2px solid #ff3366",
             cursor: "pointer", textShadow: "0 0 8px #ff336677",
-          }}>▲ ВВЕРХ<br/><span style={{ fontSize: 11, color: "#552233" }}>[Q] АНОМАЛИЯ</span></button>
+          }}>▲ ВВЕРХ [Q]<br/><span style={{ fontSize: 10, color: "#552233" }}>АНОМАЛИЯ</span></button>
 
           <button onClick={onLiftDown} style={{
-            fontFamily: "'VT323', monospace", fontSize: 20, padding: "10px 0", lineHeight: 1.5,
+            fontFamily: "'VT323', monospace", fontSize: 18, padding: "8px 0", lineHeight: 1.5,
             background: "#090c09", color: "#00ff88", border: "2px solid #00ff88",
             cursor: "pointer", textShadow: "0 0 8px #00ff8877",
-          }}>▼ ВНИЗ<br/><span style={{ fontSize: 11, color: "#224433" }}>[F] ЧИСТО</span></button>
+          }}>▼ ВНИЗ [F]<br/><span style={{ fontSize: 10, color: "#224433" }}>ЧИСТО</span></button>
 
-          <div style={{ fontSize: 12, color: "#225533", letterSpacing: 2, marginTop: 4 }}>ДЕЙСТВИЯ</div>
+          <div style={{ fontSize: 11, color: "#225533", letterSpacing: 2, marginTop: 4 }}>ДЕЙСТВИЯ</div>
           <button onClick={onInspect} style={{
-            fontFamily: "'VT323', monospace", fontSize: 18, padding: "8px 0", lineHeight: 1.5,
+            fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
             background: "#090910", color: "#4488ff", border: "2px solid #4488ff",
             cursor: "pointer",
           }}>◈ ОСМОТР [E]</button>
 
           <button onClick={onHide} style={{
-            fontFamily: "'VT323', monospace", fontSize: 18, padding: "8px 0", lineHeight: 1.5,
+            fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
             background: "#090910", color: "#8844ff", border: "2px solid #8844ff",
             cursor: "pointer",
           }}>🫥 ШКАФ [H]</button>
 
-          <div style={{ marginTop: "auto", fontSize: 11, color: "#1a2a1a", lineHeight: 2.2, borderTop: "1px solid #111", paddingTop: 8 }}>
-            WASD — движение<br/>E — осмотр<br/>H — шкаф<br/>Q — вверх<br/>F — вниз<br/>R — рестарт
+          <button onClick={onShop} style={{
+            fontFamily: "'VT323', monospace", fontSize: 17, padding: "7px 0", lineHeight: 1.5,
+            background: "#0a0800", color: "#aa8800", border: "2px solid #aa8800",
+            cursor: "pointer",
+          }}>🪙 МАГАЗИН [P]</button>
+
+          <div style={{ marginTop: "auto", fontSize: 10, color: "#1a2a1a", lineHeight: 2.2, borderTop: "1px solid #111", paddingTop: 8 }}>
+            WASD — движение<br/>E — осмотр<br/>H — шкаф<br/>Q — лифт↑<br/>F — лифт↓<br/>R — рестарт
           </div>
         </div>
       </div>
 
       {/* MESSAGE BAR */}
       <div style={{
-        height: 44, background: "#05050a", borderTop: "2px solid #12122a",
+        height: 40, background: "#05050a", borderTop: "2px solid #12122a",
         display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
       }}>
         {message && (
           <div style={{
-            fontSize: 20,
-            color: message.includes("❌") || message.includes("☠") ? "#ff3366" : message.includes("▶") || message.includes("✓") || message.includes("◈") ? "#ff9900" : "#888",
+            fontSize: 19,
+            color: message.includes("❌") || message.includes("☠") ? "#ff3366"
+              : message.includes("▶") || message.includes("✓") || message.includes("◈") ? "#ff9900"
+              : "#888",
             textShadow: "0 0 6px currentColor",
           }}>{message}</div>
         )}
@@ -840,7 +1059,7 @@ function GameScreen({
       {/* MOBILE D-PAD */}
       <div style={{
         display: "flex", flexDirection: "column", alignItems: "center",
-        gap: 3, padding: "6px 0 8px", background: "#05050a",
+        gap: 3, padding: "5px 0 7px", background: "#05050a",
         borderTop: "1px solid #111", flexShrink: 0,
       }}>
         <MBtn onClick={() => onMove("up")}>▲</MBtn>
@@ -854,8 +1073,9 @@ function GameScreen({
           <MBtn onClick={onHide} color="#8844ff">H</MBtn>
         </div>
         <div style={{ display: "flex", gap: 3, marginTop: 2 }}>
-          <MBtn onClick={onLiftUp} color="#ff3366">▲Q</MBtn>
-          <MBtn onClick={onLiftDown} color="#00ff88">▼F</MBtn>
+          <MBtn onClick={onLiftUp} color="#ff3366">Q▲</MBtn>
+          <MBtn onClick={onLiftDown} color="#00ff88">F▼</MBtn>
+          <MBtn onClick={onShop} color="#aa8800">P</MBtn>
         </div>
       </div>
 
